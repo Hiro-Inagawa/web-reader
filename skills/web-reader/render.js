@@ -1,31 +1,10 @@
 #!/usr/bin/env node
 
-const { execSync } = require('child_process');
+const childProcess = require('child_process');
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-
-const args = process.argv.slice(2);
-const url = args.find(a => !a.startsWith('--'));
-
-if (!url) {
-  console.error('Usage: node render.js <url> [--wait ms] [--screenshot] [--html] [--method defuddle|browser|handler]');
-  process.exit(1);
-}
-
-// Validate URL before doing anything
-try { new URL(url); } catch {
-  console.error('Error: Invalid URL: ' + url);
-  process.exit(1);
-}
-
-const waitTime = parseInt(args[args.indexOf('--wait') + 1]) || 3000;
-const takeScreenshot = args.includes('--screenshot');
-const outputHtml = args.includes('--html');
-const forceMethod = args.includes('--method')
-  ? args[args.indexOf('--method') + 1]
-  : null;
 
 const API_TIMEOUT = 15000;
 const MIN_CONTENT_LENGTH = 50;
@@ -33,19 +12,20 @@ const MIN_CONTENT_LENGTH = 50;
 // --- Domain Memory (atomic writes to prevent race conditions) ---
 const domainsPath = path.join(__dirname, 'domains.json');
 
-function loadDomainMemory() {
+function loadDomainMemory(filePath) {
   try {
-    return JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath || domainsPath, 'utf8'));
   } catch {
     return {};
   }
 }
 
-function saveDomainMemory(memory) {
-  const tmpPath = domainsPath + '.tmp.' + process.pid;
+function saveDomainMemory(memory, filePath) {
+  const target = filePath || domainsPath;
+  const tmpPath = target + '.tmp.' + process.pid;
   try {
     fs.writeFileSync(tmpPath, JSON.stringify(memory, null, 2));
-    fs.renameSync(tmpPath, domainsPath);
+    fs.renameSync(tmpPath, target);
   } catch {
     try { fs.unlinkSync(tmpPath); } catch {}
   }
@@ -150,13 +130,11 @@ const handlers = {
             lines.push(indent + 'u/' + c.by);
             lines.push(indent + (c.text || '').replace(/<[^>]+>/g, ''));
             lines.push('');
-            // Fetch nested replies in parallel (max 5)
             if (c.kids) {
               await Promise.all(c.kids.slice(0, 5).map(kid => fetchComment(kid, depth + 1)));
             }
           } catch {}
         };
-        // Fetch top-level comments in parallel batches of 5
         const topKids = item.kids.slice(0, 20);
         for (let i = 0; i < topKids.length; i += 5) {
           await Promise.all(topKids.slice(i, i + 5).map(kid => fetchComment(kid, 0)));
@@ -173,7 +151,6 @@ const handlers = {
       const lang = urlObj.hostname.split('.')[0];
       const title = decodeURIComponent(urlObj.pathname.replace('/wiki/', ''));
 
-      // Get full text directly via TextExtracts API (single call)
       const fullUrl = 'https://' + lang + '.wikipedia.org/w/api.php?action=query&titles=' +
         encodeURIComponent(title) + '&prop=extracts|info&explaintext=1&format=json&inprop=displaytitle';
       const res = await fetchWithTimeout(fullUrl, {
@@ -202,7 +179,6 @@ const handlers = {
       const apiBase = 'https://api.github.com/repos/' + owner + '/' + repo;
       const headers = { 'User-Agent': 'web-reader/1.0' };
 
-      // Check for issue/PR URLs
       const issueMatch = url.match(/\/(issues|pull)\/(\d+)/);
       if (issueMatch) {
         const [, type, number] = issueMatch;
@@ -218,7 +194,6 @@ const handlers = {
         lines.push('');
         if (item.body) lines.push(item.body);
 
-        // Fetch comments
         const commentsRes = await fetchWithTimeout(apiBase + '/issues/' + number + '/comments?per_page=30', { headers });
         if (commentsRes.ok) {
           const comments = await commentsRes.json();
@@ -232,13 +207,9 @@ const handlers = {
         return lines.join('\n');
       }
 
-      // Check for discussion URLs (fall through to browser)
       if (url.match(/\/discussions\//)) return null;
-
-      // Check for file/tree URLs (fall through to browser)
       if (url.match(/\/(blob|tree)\//)) return null;
 
-      // Repo root
       const res = await fetchWithTimeout(apiBase, { headers });
       if (!res.ok) throw new Error('GitHub API returned ' + res.status);
       const data = await res.json();
@@ -254,7 +225,6 @@ const handlers = {
       if (data.topics?.length) lines.push('Topics: ' + data.topics.join(', '));
       lines.push('');
 
-      // Try to get README
       const readmeRes = await fetchWithTimeout(apiBase + '/readme', {
         headers: { ...headers, 'Accept': 'application/vnd.github.raw+json' }
       });
@@ -271,8 +241,7 @@ const handlers = {
 // --- Defuddle Layer (single fetch, safe URL escaping) ---
 function tryDefuddle(url) {
   try {
-    // JSON.stringify properly escapes the URL for shell safety
-    const md = execSync('defuddle parse ' + JSON.stringify(url) + ' --md', {
+    const md = childProcess.execSync('defuddle parse ' + JSON.stringify(url) + ' --md', {
       timeout: 20000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe']
@@ -306,7 +275,8 @@ async function launchStealth() {
   return { browser, context };
 }
 
-async function fetchWithBrowser(url) {
+async function fetchWithBrowser(url, opts = {}) {
+  const { waitTime = 3000, screenshot = false, html = false } = opts;
   const { browser, context } = await launchStealth();
   const page = await context.newPage();
 
@@ -314,19 +284,18 @@ async function fetchWithBrowser(url) {
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(waitTime);
 
-    if (takeScreenshot) {
+    if (screenshot) {
       const screenshotPath = path.join(os.tmpdir(), 'web-reader-screenshot.png');
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.error('Screenshot saved to ' + screenshotPath);
     }
 
-    if (outputHtml) {
+    if (html) {
       return await page.content();
     }
 
     const text = await page.evaluate(() => document.body.innerText);
 
-    // Validate that we got meaningful content
     if (!text || text.trim().length < MIN_CONTENT_LENGTH) {
       return null;
     }
@@ -337,15 +306,23 @@ async function fetchWithBrowser(url) {
 }
 
 // --- Main Cascade ---
-(async () => {
+async function cascade(url, opts = {}) {
+  const {
+    forceMethod = null,
+    screenshot = false,
+    html = false,
+    waitTime = 3000,
+    domainsFile = domainsPath
+  } = opts;
+
   const domain = getDomain(url);
-  const memory = loadDomainMemory();
+  const memory = loadDomainMemory(domainsFile);
   const remembered = domain ? memory[domain] : null;
+  const browserOpts = { waitTime, screenshot, html };
 
   let result = null;
   let method = null;
 
-  // If forced method, use it directly
   if (forceMethod) {
     if (forceMethod === 'handler') {
       for (const [name, handler] of Object.entries(handlers)) {
@@ -361,12 +338,11 @@ async function fetchWithBrowser(url) {
       if (!result) throw new Error('Defuddle returned no content');
       method = 'defuddle';
     } else if (forceMethod === 'browser') {
-      result = await fetchWithBrowser(url);
+      result = await fetchWithBrowser(url, browserOpts);
       if (!result) throw new Error('Browser returned no content');
       method = 'browser';
     }
   }
-  // If we remember what works for this domain, try that first
   else if (remembered) {
     console.error('[web-reader] Using remembered method for ' + domain + ': ' + remembered);
 
@@ -381,7 +357,7 @@ async function fetchWithBrowser(url) {
         result = tryDefuddle(url);
         if (result) method = 'defuddle';
       } else if (remembered === 'browser') {
-        result = await fetchWithBrowser(url);
+        result = await fetchWithBrowser(url, browserOpts);
         if (result) method = 'browser';
       }
     } catch (e) {
@@ -393,10 +369,8 @@ async function fetchWithBrowser(url) {
     }
   }
 
-  // Full cascade: handler -> defuddle -> browser
   if (!result) {
-    // 1. Site-specific handlers
-    if (!takeScreenshot && !outputHtml) {
+    if (!screenshot && !html) {
       for (const [name, handler] of Object.entries(handlers)) {
         if (handler.match(url)) {
           try {
@@ -410,34 +384,68 @@ async function fetchWithBrowser(url) {
       }
     }
 
-    // 2. Defuddle (fast, no browser)
-    if (!result && !takeScreenshot && !outputHtml) {
+    if (!result && !screenshot && !html) {
       console.error('[web-reader] Trying defuddle...');
       result = tryDefuddle(url);
       if (result) method = 'defuddle';
     }
 
-    // 3. Stealth browser (handles everything else)
     if (!result) {
       console.error('[web-reader] Trying stealth browser...');
-      result = await fetchWithBrowser(url);
+      result = await fetchWithBrowser(url, browserOpts);
       if (result) method = 'browser';
     }
   }
 
-  if (result) {
-    console.log(result);
+  if (result && domain && method) {
+    memory[domain] = method;
+    saveDomainMemory(memory, domainsFile);
+  }
 
-    // Save to domain memory
-    if (domain && method) {
-      memory[domain] = method;
-      saveDomainMemory(memory);
-    }
-  } else {
-    console.error('[web-reader] All methods failed for ' + url);
+  return { result, method };
+}
+
+// --- Exports for testing ---
+module.exports = {
+  handlers, tryDefuddle, fetchWithBrowser, launchStealth,
+  fetchWithTimeout, loadDomainMemory, saveDomainMemory,
+  getDomain, cascade,
+  API_TIMEOUT, MIN_CONTENT_LENGTH, domainsPath
+};
+
+// --- CLI Entry Point ---
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const url = args.find(a => !a.startsWith('--'));
+
+  if (!url) {
+    console.error('Usage: node render.js <url> [--wait ms] [--screenshot] [--html] [--method defuddle|browser|handler]');
     process.exit(1);
   }
-})().catch(e => {
-  console.error('Error: ' + e.message);
-  process.exit(1);
-});
+
+  try { new URL(url); } catch {
+    console.error('Error: Invalid URL: ' + url);
+    process.exit(1);
+  }
+
+  const waitTime = parseInt(args[args.indexOf('--wait') + 1]) || 3000;
+  const screenshot = args.includes('--screenshot');
+  const html = args.includes('--html');
+  const forceMethod = args.includes('--method')
+    ? args[args.indexOf('--method') + 1]
+    : null;
+
+  cascade(url, { forceMethod, screenshot, html, waitTime })
+    .then(({ result }) => {
+      if (result) {
+        console.log(result);
+      } else {
+        console.error('[web-reader] All methods failed for ' + url);
+        process.exit(1);
+      }
+    })
+    .catch(e => {
+      console.error('Error: ' + e.message);
+      process.exit(1);
+    });
+}

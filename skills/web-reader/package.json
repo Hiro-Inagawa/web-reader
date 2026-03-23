@@ -5,7 +5,7 @@
   "main": "render.js",
   "scripts": {
     "setup": "npm install && npx playwright install chromium",
-    "test": "node render.js https://example.com"
+    "test": "node --test render.test.js"
   },
   "dependencies": {
     "playwright": "^1.50.0"
