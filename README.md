@@ -9,13 +9,28 @@
 
 # Web Reader
 
-**Read any website, including JavaScript SPAs, from Claude Code. One script, 30 lines.**
+**Read any website, including JavaScript SPAs, from Claude Code. One skill, all websites.**
 
-A Claude Code skill that renders JavaScript-heavy websites and returns their text content. No automation suite. No API keys. No running servers. Just: URL in, text out.
+A Claude Code skill that reads any URL using the fastest method that works. It cascades through three layers automatically, then remembers what worked so the next request is instant.
+
+```
+URL comes in
+    |
+    +-- 1. Site handler?  (Reddit, HN, Wikipedia, GitHub)
+    |      Uses the site's own API. Instant. Structured output.
+    |
+    +-- 2. Defuddle?      (blogs, docs, news, static sites)
+    |      Fast extraction, no browser needed. Handles ~70% of the web.
+    |
+    +-- 3. Stealth browser (SPAs, Cloudflare, everything else)
+           Headless Chromium with bot-detection bypass.
+```
+
+After each successful fetch, it saves the working method to `domains.json`. Next time the same domain is requested, it skips straight to what works.
 
 ## Why This Exists
 
-Claude Code's built-in `WebFetch` [cannot render JavaScript](https://docs.anthropic.com/en/docs/claude-code). Anthropic documents this limitation themselves. That means any modern SPA -- React, Next.js, Vue, Angular -- returns a blank page or just a `<title>` tag.
+Claude Code's built-in `WebFetch` [cannot render JavaScript](https://docs.anthropic.com/en/docs/claude-code). Anthropic documents this limitation themselves. That means any modern SPA returns a blank page or just a `<title>` tag.
 
 Sites affected include **crates.io, npmjs.com, Reddit, Medium, Quora**, and most documentation platforms built on Mintlify, GitBook, or Docusaurus.
 
@@ -30,7 +45,7 @@ Every alternative bundles full browser automation far beyond simple content read
 | [Playwright MCP](https://github.com/nicholasxwang/playwright-mcp) (Microsoft) | 26+ tools for browser control, device emulation, accessibility testing | Read a webpage |
 | Firecrawl / Bright Data | External paid services with API keys | Read a webpage |
 
-Web Reader does **one thing**: renders a page and gives you the text. That's it. 30 lines of code, zero configuration.
+Web Reader does **one thing**: gets you the content of a URL. It just picks the smartest way to do it.
 
 ## Installation
 
@@ -69,6 +84,16 @@ npm run setup
 rm -rf /tmp/web-reader
 ```
 
+### Optional: Defuddle CLI
+
+For the fast extraction layer (recommended but not required):
+
+```bash
+npm install -g defuddle
+```
+
+Without Defuddle, the skill still works. It just skips Layer 2 and goes straight to the browser for non-handler sites.
+
 ## Usage
 
 Once installed, just ask Claude Code to look at any website:
@@ -79,51 +104,60 @@ Once installed, just ask Claude Code to look at any website:
 "Check out https://coachsensai.com and tell me what they do"
 ```
 
-Claude will automatically use the skill when `WebFetch` fails on JavaScript-heavy sites.
-
 ### Direct Usage
 
 ```bash
-# Get text content
+# Get text content (auto-cascades through methods)
 node render.js "https://example.com"
 
-# Take a screenshot
+# Force a specific method
+node render.js "https://example.com" --method defuddle
+node render.js "https://example.com" --method browser
+
+# Take a screenshot (uses browser)
 node render.js "https://example.com" --screenshot
 
-# Get raw HTML
+# Get raw HTML (uses browser)
 node render.js "https://example.com" --html
 
 # Wait longer for slow sites
 node render.js "https://example.com" --wait 8000
 ```
 
-## How It Works
+## Site Handlers
 
-1. Checks for site-specific handlers (Reddit URLs use the JSON API directly)
-2. For everything else, launches headless Chromium with stealth measures
-3. Navigates to the URL and waits for JavaScript to finish rendering
-4. Extracts all visible text from the rendered page
-5. Returns it to Claude Code
+Sites that block browsers or have better APIs get dedicated handlers:
 
-### Stealth Mode
+| Site | Method | Output |
+|------|--------|--------|
+| Reddit | JSON API | Posts, threaded comments, scores |
+| Hacker News | Firebase API | Stories, comment threads |
+| Wikipedia | REST API | Full article text |
+| GitHub repos | REST API | Repo info, stats, README |
 
-The browser launches with countermeasures against common bot detection: real user-agent, hidden `navigator.webdriver` flag, fake plugin array, and proper locale/timezone. This bypasses most Cloudflare challenges and similar protections.
+Handlers are tried first because they're fastest and most reliable. Adding a new handler is just adding a `match` + `fetch` function to the `handlers` object in `render.js`.
 
-### Site Handlers
+## Domain Memory
 
-Some sites block all browsers but have alternative access methods. Web Reader detects these URLs and uses the right approach automatically:
+`domains.json` builds up automatically as you use the skill:
 
-| Site | Method |
-|------|--------|
-| Reddit (threads, subreddits) | JSON API with structured output (posts, comments, scores) |
-| Everything else | Stealth headless Chromium |
+```json
+{
+  "reddit.com": "handler:reddit",
+  "coachsensai.com": "browser",
+  "docs.anthropic.com": "defuddle",
+  "crates.io": "browser",
+  "en.wikipedia.org": "handler:wikipedia"
+}
+```
 
-No testing framework. No automation helpers. No complex configuration.
+First visit to a domain: cascades through all layers. Every visit after: instant routing. Delete or edit the file to reset.
 
 ## Requirements
 
 - Node.js v18+
 - ~110 MB disk space (for Chromium, downloaded once during setup)
+- Optional: `defuddle` CLI for Layer 2
 
 ## License
 
