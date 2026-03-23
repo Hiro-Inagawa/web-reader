@@ -49,7 +49,15 @@ Web Reader does **one thing**: gets you the content of a URL. It just picks the 
 
 ## Installation
 
-### Option 1: Plugin (Recommended)
+One command. Installs the skill, Playwright, Chromium, and Defuddle:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Hiro-Inagawa/web-reader/main/install.sh | bash
+```
+
+That's it. Works on macOS and Linux. On Windows, run it in Git Bash or WSL.
+
+### Alternative: Plugin Marketplace
 
 ```bash
 /plugin marketplace add Hiro-Inagawa/web-reader
@@ -63,7 +71,7 @@ cd ~/.claude/plugins/marketplaces/web-reader/skills/web-reader
 npm run setup
 ```
 
-### Option 2: Global Skill
+### Alternative: Manual Install
 
 ```bash
 git clone https://github.com/Hiro-Inagawa/web-reader.git /tmp/web-reader
@@ -73,26 +81,7 @@ npm run setup
 rm -rf /tmp/web-reader
 ```
 
-### Option 3: Project Skill
-
-```bash
-git clone https://github.com/Hiro-Inagawa/web-reader.git /tmp/web-reader
-mkdir -p .claude/skills
-cp -r /tmp/web-reader/skills/web-reader .claude/skills/
-cd .claude/skills/web-reader
-npm run setup
-rm -rf /tmp/web-reader
-```
-
-### Optional: Defuddle CLI
-
-For the fast extraction layer (recommended but not required):
-
-```bash
-npm install -g defuddle
-```
-
-Without Defuddle, the skill still works. It just skips Layer 2 and goes straight to the browser for non-handler sites.
+Optionally install Defuddle for the fast extraction layer: `npm install -g defuddle`
 
 ## Usage
 
