@@ -1,3 +1,12 @@
+```
+ __      __   _      ___               _
+ \ \    / /__| |__  | _ \___ __ _ __ _| |___ _ _
+  \ \/\/ / -_) '_ \ |   / -_) _` / _` |  _| '_|
+   \_/\_/\___|_.__/ |_|_\___\__,_\__,_|\__|_|
+
+  URL in. Text out. That's it.
+```
+
 # Web Reader
 
 **Read any website, including JavaScript SPAs, from Claude Code. One script, 30 lines.**
