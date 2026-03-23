@@ -1,10 +1,27 @@
 # Web Reader
 
-A Claude Code skill that renders JavaScript-heavy websites (SPAs) using headless Chromium and returns their content.
+**Read any website, including JavaScript SPAs, from Claude Code. One script, 30 lines.**
 
-## The Problem
+A Claude Code skill that renders JavaScript-heavy websites and returns their text content. No automation suite. No API keys. No running servers. Just: URL in, text out.
 
-Claude Code's built-in `WebFetch` tool can't render JavaScript. Most modern websites (React, Next.js, Vue, Angular) return a blank page or just a `<title>` tag. This skill fixes that.
+## Why This Exists
+
+Claude Code's built-in `WebFetch` [cannot render JavaScript](https://docs.anthropic.com/en/docs/claude-code). Anthropic documents this limitation themselves. That means any modern SPA -- React, Next.js, Vue, Angular -- returns a blank page or just a `<title>` tag.
+
+Sites affected include **crates.io, npmjs.com, Reddit, Medium, Quora**, and most documentation platforms built on Mintlify, GitBook, or Docusaurus.
+
+## Why Not Use an Existing Solution?
+
+Every alternative bundles full browser automation far beyond simple content reading:
+
+| Tool | What you get | What you actually needed |
+|------|-------------|------------------------|
+| [dev-browser](https://github.com/nicholasxwang/dev-browser) (3,800+ stars) | Chrome extension, session management, form filling, AI-optimized DOM snapshots, QuickJS sandbox | Read a webpage |
+| [playwright-skill](https://github.com/lackeyjb/playwright-skill) (1,500+ stars) | Full Playwright scripting, visible browser window, test workflows | Read a webpage |
+| [Playwright MCP](https://github.com/nicholasxwang/playwright-mcp) (Microsoft) | 26+ tools for browser control, device emulation, accessibility testing | Read a webpage |
+| Firecrawl / Bright Data | External paid services with API keys | Read a webpage |
+
+Web Reader does **one thing**: renders a page and gives you the text. That's it. 30 lines of code, zero configuration.
 
 ## Installation
 
@@ -75,11 +92,11 @@ node render.js "https://example.com" --wait 8000
 
 1. Launches headless Chromium via Playwright
 2. Navigates to the URL
-3. Waits for network requests to finish + a buffer for late-loading content
+3. Waits for JavaScript to finish rendering
 4. Extracts all visible text from the rendered page
 5. Returns it to Claude Code
 
-That's it. No testing framework, no automation helpers, no complex configuration. Just: **URL in, content out.**
+No testing framework. No automation helpers. No complex configuration. The entire implementation is [30 lines](skills/web-reader/render.js).
 
 ## Requirements
 
