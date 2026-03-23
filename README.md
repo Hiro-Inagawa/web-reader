@@ -99,13 +99,26 @@ node render.js "https://example.com" --wait 8000
 
 ## How It Works
 
-1. Launches headless Chromium via Playwright
-2. Navigates to the URL
-3. Waits for JavaScript to finish rendering
+1. Checks for site-specific handlers (Reddit URLs use the JSON API directly)
+2. For everything else, launches headless Chromium with stealth measures
+3. Navigates to the URL and waits for JavaScript to finish rendering
 4. Extracts all visible text from the rendered page
 5. Returns it to Claude Code
 
-No testing framework. No automation helpers. No complex configuration. The entire implementation is [30 lines](skills/web-reader/render.js).
+### Stealth Mode
+
+The browser launches with countermeasures against common bot detection: real user-agent, hidden `navigator.webdriver` flag, fake plugin array, and proper locale/timezone. This bypasses most Cloudflare challenges and similar protections.
+
+### Site Handlers
+
+Some sites block all browsers but have alternative access methods. Web Reader detects these URLs and uses the right approach automatically:
+
+| Site | Method |
+|------|--------|
+| Reddit (threads, subreddits) | JSON API with structured output (posts, comments, scores) |
+| Everything else | Stealth headless Chromium |
+
+No testing framework. No automation helpers. No complex configuration.
 
 ## Requirements
 
