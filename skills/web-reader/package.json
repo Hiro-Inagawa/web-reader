@@ -1,0 +1,14 @@
+{
+  "name": "web-reader",
+  "version": "1.0.0",
+  "description": "Renders JavaScript-heavy websites and returns their content.",
+  "main": "render.js",
+  "scripts": {
+    "setup": "npm install && npx playwright install chromium",
+    "test": "node render.js https://example.com"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  },
+  "license": "MIT"
+}

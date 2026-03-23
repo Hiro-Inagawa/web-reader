@@ -1,0 +1,8 @@
+{
+  "name": "web-reader",
+  "version": "1.0.0",
+  "description": "Claude Code skill that renders JavaScript-heavy websites (SPAs) and returns their content.",
+  "author": "Hiro-Inagawa",
+  "license": "MIT",
+  "skills": ["skills/web-reader"]
+}
