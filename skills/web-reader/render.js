@@ -4,12 +4,19 @@ const { execSync } = require('child_process');
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const args = process.argv.slice(2);
 const url = args.find(a => !a.startsWith('--'));
 
 if (!url) {
   console.error('Usage: node render.js <url> [--wait ms] [--screenshot] [--html] [--method defuddle|browser|handler]');
+  process.exit(1);
+}
+
+// Validate URL before doing anything
+try { new URL(url); } catch {
+  console.error('Error: Invalid URL: ' + url);
   process.exit(1);
 }
 
@@ -20,7 +27,10 @@ const forceMethod = args.includes('--method')
   ? args[args.indexOf('--method') + 1]
   : null;
 
-// --- Domain Memory ---
+const API_TIMEOUT = 15000;
+const MIN_CONTENT_LENGTH = 50;
+
+// --- Domain Memory (atomic writes to prevent race conditions) ---
 const domainsPath = path.join(__dirname, 'domains.json');
 
 function loadDomainMemory() {
@@ -32,7 +42,13 @@ function loadDomainMemory() {
 }
 
 function saveDomainMemory(memory) {
-  fs.writeFileSync(domainsPath, JSON.stringify(memory, null, 2));
+  const tmpPath = domainsPath + '.tmp.' + process.pid;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(memory, null, 2));
+    fs.renameSync(tmpPath, domainsPath);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
 }
 
 function getDomain(url) {
@@ -43,6 +59,18 @@ function getDomain(url) {
   }
 }
 
+// --- Fetch with timeout ---
+async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // --- Site-Specific Handlers ---
 const handlers = {
   reddit: {
@@ -50,7 +78,7 @@ const handlers = {
     fetch: async (url) => {
       const jsonUrl = url.replace(/\/?(\?.*)?$/, '.json$1');
       const separator = jsonUrl.includes('?') ? '&' : '?';
-      const res = await fetch(jsonUrl + separator + 'limit=50', {
+      const res = await fetchWithTimeout(jsonUrl + separator + 'limit=50', {
         headers: { 'User-Agent': 'web-reader/1.0 (github.com/Hiro-Inagawa/web-reader)' }
       });
       if (!res.ok) throw new Error('Reddit API returned ' + res.status);
@@ -101,7 +129,7 @@ const handlers = {
       const idMatch = url.match(/id=(\d+)/);
       if (!idMatch) throw new Error('No HN item ID found in URL');
       const id = idMatch[1];
-      const res = await fetch('https://hacker-news.firebaseio.com/v0/item/' + id + '.json');
+      const res = await fetchWithTimeout('https://hacker-news.firebaseio.com/v0/item/' + id + '.json');
       const item = await res.json();
 
       const lines = [];
@@ -113,22 +141,25 @@ const handlers = {
 
       if (item.kids && item.kids.length > 0) {
         const fetchComment = async (id, depth) => {
-          const r = await fetch('https://hacker-news.firebaseio.com/v0/item/' + id + '.json');
-          const c = await r.json();
-          if (!c || c.deleted || c.dead) return;
-          const indent = '  '.repeat(depth);
-          lines.push('---');
-          lines.push(indent + 'u/' + c.by);
-          lines.push(indent + (c.text || '').replace(/<[^>]+>/g, ''));
-          lines.push('');
-          if (c.kids) {
-            for (const kid of c.kids.slice(0, 5)) {
-              await fetchComment(kid, depth + 1);
+          try {
+            const r = await fetchWithTimeout('https://hacker-news.firebaseio.com/v0/item/' + id + '.json');
+            const c = await r.json();
+            if (!c || c.deleted || c.dead) return;
+            const indent = '  '.repeat(depth);
+            lines.push('---');
+            lines.push(indent + 'u/' + c.by);
+            lines.push(indent + (c.text || '').replace(/<[^>]+>/g, ''));
+            lines.push('');
+            // Fetch nested replies in parallel (max 5)
+            if (c.kids) {
+              await Promise.all(c.kids.slice(0, 5).map(kid => fetchComment(kid, depth + 1)));
             }
-          }
+          } catch {}
         };
-        for (const kid of item.kids.slice(0, 20)) {
-          await fetchComment(kid, 0);
+        // Fetch top-level comments in parallel batches of 5
+        const topKids = item.kids.slice(0, 20);
+        for (let i = 0; i < topKids.length; i += 5) {
+          await Promise.all(topKids.slice(i, i + 5).map(kid => fetchComment(kid, 0)));
         }
       }
       return lines.join('\n');
@@ -141,51 +172,74 @@ const handlers = {
       const urlObj = new URL(url);
       const lang = urlObj.hostname.split('.')[0];
       const title = decodeURIComponent(urlObj.pathname.replace('/wiki/', ''));
-      const apiUrl = 'https://' + lang + '.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(title);
-      const res = await fetch(apiUrl, {
+
+      // Get full text directly via TextExtracts API (single call)
+      const fullUrl = 'https://' + lang + '.wikipedia.org/w/api.php?action=query&titles=' +
+        encodeURIComponent(title) + '&prop=extracts|info&explaintext=1&format=json&inprop=displaytitle';
+      const res = await fetchWithTimeout(fullUrl, {
         headers: { 'User-Agent': 'web-reader/1.0 (github.com/Hiro-Inagawa/web-reader)' }
       });
       if (!res.ok) throw new Error('Wikipedia API returned ' + res.status);
       const data = await res.json();
+      const pages = data.query?.pages || {};
+      const page = Object.values(pages)[0];
+      if (!page || page.missing !== undefined) throw new Error('Wikipedia article not found');
 
       const lines = [];
-      lines.push('# ' + data.title);
-      if (data.description) lines.push('*' + data.description + '*');
+      lines.push('# ' + (page.displaytitle || page.title || title));
       lines.push('');
-      lines.push(data.extract);
-
-      // Also get the full text via TextExtracts API
-      const fullUrl = 'https://' + lang + '.wikipedia.org/w/api.php?action=query&titles=' +
-        encodeURIComponent(title) + '&prop=extracts&explaintext=1&format=json';
-      const fullRes = await fetch(fullUrl, {
-        headers: { 'User-Agent': 'web-reader/1.0 (github.com/Hiro-Inagawa/web-reader)' }
-      });
-      if (fullRes.ok) {
-        const fullData = await fullRes.json();
-        const pages = fullData.query?.pages || {};
-        const page = Object.values(pages)[0];
-        if (page?.extract) {
-          lines.length = 0;
-          lines.push('# ' + data.title);
-          if (data.description) lines.push('*' + data.description + '*');
-          lines.push('');
-          lines.push(page.extract);
-        }
-      }
+      lines.push(page.extract || '');
       return lines.join('\n');
     }
   },
 
   github: {
-    match: (url) => /^https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/?$/i.test(url),
+    match: (url) => /^https?:\/\/github\.com\/[\w.-]+\/[\w.-]+(\/.*)?$/i.test(url),
     fetch: async (url) => {
-      const match = url.match(/github\.com\/([\w.-]+)\/([\w.-]+)/);
-      if (!match) throw new Error('Could not parse GitHub URL');
-      const [, owner, repo] = match;
-      const apiUrl = 'https://api.github.com/repos/' + owner + '/' + repo;
-      const res = await fetch(apiUrl, {
-        headers: { 'User-Agent': 'web-reader/1.0' }
-      });
+      const repoMatch = url.match(/github\.com\/([\w.-]+)\/([\w.-]+)/);
+      if (!repoMatch) throw new Error('Could not parse GitHub URL');
+      const [, owner, repo] = repoMatch;
+      const apiBase = 'https://api.github.com/repos/' + owner + '/' + repo;
+      const headers = { 'User-Agent': 'web-reader/1.0' };
+
+      // Check for issue/PR URLs
+      const issueMatch = url.match(/\/(issues|pull)\/(\d+)/);
+      if (issueMatch) {
+        const [, type, number] = issueMatch;
+        const endpoint = type === 'pull' ? '/pulls/' : '/issues/';
+        const res = await fetchWithTimeout(apiBase + endpoint + number, { headers });
+        if (!res.ok) throw new Error('GitHub API returned ' + res.status);
+        const item = await res.json();
+
+        const lines = [];
+        lines.push('# ' + item.title + ' (#' + number + ')');
+        lines.push('State: ' + item.state + ' | Author: ' + item.user.login + ' | Created: ' + item.created_at);
+        if (item.labels?.length) lines.push('Labels: ' + item.labels.map(l => l.name).join(', '));
+        lines.push('');
+        if (item.body) lines.push(item.body);
+
+        // Fetch comments
+        const commentsRes = await fetchWithTimeout(apiBase + '/issues/' + number + '/comments?per_page=30', { headers });
+        if (commentsRes.ok) {
+          const comments = await commentsRes.json();
+          for (const c of comments) {
+            lines.push('');
+            lines.push('---');
+            lines.push('**' + c.user.login + '** (' + c.created_at + ')');
+            lines.push(c.body);
+          }
+        }
+        return lines.join('\n');
+      }
+
+      // Check for discussion URLs (fall through to browser)
+      if (url.match(/\/discussions\//)) return null;
+
+      // Check for file/tree URLs (fall through to browser)
+      if (url.match(/\/(blob|tree)\//)) return null;
+
+      // Repo root
+      const res = await fetchWithTimeout(apiBase, { headers });
       if (!res.ok) throw new Error('GitHub API returned ' + res.status);
       const data = await res.json();
 
@@ -201,8 +255,8 @@ const handlers = {
       lines.push('');
 
       // Try to get README
-      const readmeRes = await fetch(apiUrl + '/readme', {
-        headers: { 'User-Agent': 'web-reader/1.0', 'Accept': 'application/vnd.github.raw+json' }
+      const readmeRes = await fetchWithTimeout(apiBase + '/readme', {
+        headers: { ...headers, 'Accept': 'application/vnd.github.raw+json' }
       });
       if (readmeRes.ok) {
         const readme = await readmeRes.text();
@@ -214,25 +268,17 @@ const handlers = {
   }
 };
 
-// --- Defuddle Layer ---
-async function tryDefuddle(url) {
+// --- Defuddle Layer (single fetch, safe URL escaping) ---
+function tryDefuddle(url) {
   try {
-    const result = execSync('defuddle parse "' + url + '" --json', {
+    // JSON.stringify properly escapes the URL for shell safety
+    const md = execSync('defuddle parse ' + JSON.stringify(url) + ' --md', {
       timeout: 20000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe']
     });
-    const data = JSON.parse(result);
-    // Check if defuddle actually got content
-    if (data.wordCount > 10 && data.content && data.content.length > 100) {
-      // Convert to markdown if available
-      const md = execSync('defuddle parse "' + url + '" --md', {
-        timeout: 20000,
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-      if (md.trim().length > 50) return md.trim();
-    }
+    const trimmed = md.trim();
+    if (trimmed.length > MIN_CONTENT_LENGTH) return trimmed;
     return null;
   } catch {
     return null;
@@ -247,6 +293,7 @@ async function launchStealth() {
     viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
     timezoneId: 'America/New_York',
+    ignoreHTTPSErrors: true,
   });
 
   await context.addInitScript(() => {
@@ -268,7 +315,7 @@ async function fetchWithBrowser(url) {
     await page.waitForTimeout(waitTime);
 
     if (takeScreenshot) {
-      const screenshotPath = '/tmp/web-reader-screenshot.png';
+      const screenshotPath = path.join(os.tmpdir(), 'web-reader-screenshot.png');
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.error('Screenshot saved to ' + screenshotPath);
     }
@@ -276,7 +323,14 @@ async function fetchWithBrowser(url) {
     if (outputHtml) {
       return await page.content();
     }
-    return await page.evaluate(() => document.body.innerText);
+
+    const text = await page.evaluate(() => document.body.innerText);
+
+    // Validate that we got meaningful content
+    if (!text || text.trim().length < MIN_CONTENT_LENGTH) {
+      return null;
+    }
+    return text;
   } finally {
     await browser.close();
   }
@@ -303,11 +357,12 @@ async function fetchWithBrowser(url) {
       }
       if (!result) throw new Error('No handler matches this URL');
     } else if (forceMethod === 'defuddle') {
-      result = await tryDefuddle(url);
+      result = tryDefuddle(url);
       if (!result) throw new Error('Defuddle returned no content');
       method = 'defuddle';
     } else if (forceMethod === 'browser') {
       result = await fetchWithBrowser(url);
+      if (!result) throw new Error('Browser returned no content');
       method = 'browser';
     }
   }
@@ -315,18 +370,24 @@ async function fetchWithBrowser(url) {
   else if (remembered) {
     console.error('[web-reader] Using remembered method for ' + domain + ': ' + remembered);
 
-    if (remembered.startsWith('handler:')) {
-      const handlerName = remembered.split(':')[1];
-      if (handlers[handlerName]?.match(url)) {
-        result = await handlers[handlerName].fetch(url);
-        method = remembered;
+    try {
+      if (remembered.startsWith('handler:')) {
+        const handlerName = remembered.split(':')[1];
+        if (handlers[handlerName]?.match(url)) {
+          result = await handlers[handlerName].fetch(url);
+          method = remembered;
+        }
+      } else if (remembered === 'defuddle') {
+        result = tryDefuddle(url);
+        if (result) method = 'defuddle';
+      } else if (remembered === 'browser') {
+        result = await fetchWithBrowser(url);
+        if (result) method = 'browser';
       }
-    } else if (remembered === 'defuddle') {
-      result = await tryDefuddle(url);
-      method = result ? 'defuddle' : null;
+    } catch (e) {
+      console.error('[web-reader] Remembered method threw: ' + e.message);
     }
 
-    // If remembered method failed, fall through to full cascade
     if (!result) {
       console.error('[web-reader] Remembered method failed, trying full cascade');
     }
@@ -340,7 +401,7 @@ async function fetchWithBrowser(url) {
         if (handler.match(url)) {
           try {
             result = await handler.fetch(url);
-            method = 'handler:' + name;
+            if (result) method = 'handler:' + name;
           } catch (e) {
             console.error('[web-reader] Handler ' + name + ' failed: ' + e.message);
           }
@@ -352,7 +413,7 @@ async function fetchWithBrowser(url) {
     // 2. Defuddle (fast, no browser)
     if (!result && !takeScreenshot && !outputHtml) {
       console.error('[web-reader] Trying defuddle...');
-      result = await tryDefuddle(url);
+      result = tryDefuddle(url);
       if (result) method = 'defuddle';
     }
 
@@ -360,7 +421,7 @@ async function fetchWithBrowser(url) {
     if (!result) {
       console.error('[web-reader] Trying stealth browser...');
       result = await fetchWithBrowser(url);
-      method = 'browser';
+      if (result) method = 'browser';
     }
   }
 
