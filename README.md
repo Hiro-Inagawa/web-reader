@@ -113,9 +113,28 @@ node render.js "https://example.com" --html
 node render.js "https://example.com" --wait 8000
 ```
 
+## Battle-Tested Sites
+
+These are sites known for aggressive bot detection, JavaScript-only rendering, or outright blocking of automated tools. Web Reader handles all of them.
+
+| Site | Why It's Hard | How Web Reader Handles It |
+|------|---------------|--------------------------|
+| **LinkedIn** | Aggressive bot detection, login walls, fingerprinting | Stealth browser bypasses detection |
+| **Reddit** | Blocks scrapers, requires authentication for web | JSON API handler (no browser needed) |
+| **Hacker News** | JavaScript-rendered comment trees | Firebase API handler (structured data) |
+| **Medium** | Paywall, JavaScript-only rendering | Stealth browser with full JS execution |
+| **Cloudflare-protected sites** | JavaScript challenges, bot detection | Stealth browser passes challenges |
+| **React/Vue/Angular SPAs** | Content rendered entirely in JavaScript | Stealth browser waits for render |
+| **GitHub** | API rate limits, complex page structures | REST API handler (repos, issues, PRs) |
+| **Wikipedia** | Not hard, but API is faster than scraping | REST API handler (instant, structured) |
+| **Crates.io / npmjs.com** | JavaScript-only package pages | Stealth browser |
+| **Docusaurus / GitBook / Mintlify docs** | SPA documentation platforms | Defuddle or stealth browser |
+
+> Most scraping tools, MCP servers, and browser automation frameworks fail on LinkedIn. Web Reader's stealth layer (hidden `navigator.webdriver`, injected plugins, real Chrome fingerprint) makes the difference.
+
 ## Site Handlers
 
-Sites that block browsers or have better APIs get dedicated handlers:
+Sites with public APIs get dedicated handlers that are faster and more reliable than any browser:
 
 | Site | Method | Output |
 |------|--------|--------|
@@ -123,6 +142,7 @@ Sites that block browsers or have better APIs get dedicated handlers:
 | Hacker News | Firebase API | Stories, comment threads |
 | Wikipedia | REST API | Full article text |
 | GitHub repos | REST API | Repo info, stats, README |
+| GitHub issues/PRs | REST API | Title, body, comments, labels |
 
 Handlers are tried first because they're fastest and most reliable. Adding a new handler is just adding a `match` + `fetch` function to the `handlers` object in `render.js`.
 
@@ -141,6 +161,18 @@ Handlers are tried first because they're fastest and most reliable. Adding a new
 ```
 
 First visit to a domain: cascades through all layers. Every visit after: instant routing. Delete or edit the file to reset.
+
+## Verification
+
+A manual verification script tests the skill against real websites. Not for CI (live sites are inherently flaky), but useful after making changes.
+
+```bash
+node verify.js              # Run all checks (includes browser tests)
+node verify.js --quick      # Skip slow browser tests
+node verify.js wikipedia    # Run one specific check
+```
+
+The script uses a temp `domains.json` so it doesn't pollute your real domain memory.
 
 ## Requirements
 
