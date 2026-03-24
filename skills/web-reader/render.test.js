@@ -13,6 +13,11 @@ const {
   tryDefuddle, fetchWithTimeout, cascade, MIN_CONTENT_LENGTH
 } = require('./render');
 
+const {
+  parseCookieFile, chromeTimeToUnix, chromeSameSite, firefoxSameSite,
+  extractCookies, findFirefoxDefaultProfile
+} = require('./cookies');
+
 // --- Mock helpers ---
 
 function mockFetch(data) {
@@ -500,5 +505,268 @@ describe('CLI', () => {
     } catch (e) {
       assert.ok(e.stderr.includes('Usage:'));
     }
+  });
+});
+
+// ============================================================
+// Cookie utilities
+// ============================================================
+
+describe('chromeTimeToUnix', () => {
+  it('converts Chrome timestamp to Unix', () => {
+    // Chrome timestamp for 2025-01-01 00:00:00 UTC
+    // Unix: 1735689600, Chrome: (1735689600 + 11644473600) * 1000000
+    const chromeTime = (1735689600 + 11644473600) * 1000000;
+    assert.equal(chromeTimeToUnix(chromeTime), 1735689600);
+  });
+
+  it('returns -1 for zero (session cookie)', () => {
+    assert.equal(chromeTimeToUnix(0), -1);
+  });
+
+  it('returns -1 for null', () => {
+    assert.equal(chromeTimeToUnix(null), -1);
+  });
+
+  it('returns -1 for undefined', () => {
+    assert.equal(chromeTimeToUnix(undefined), -1);
+  });
+});
+
+describe('chromeSameSite', () => {
+  it('maps 0 to None', () => {
+    assert.equal(chromeSameSite(0), 'None');
+  });
+
+  it('maps 1 to Lax', () => {
+    assert.equal(chromeSameSite(1), 'Lax');
+  });
+
+  it('maps 2 to Strict', () => {
+    assert.equal(chromeSameSite(2), 'Strict');
+  });
+
+  it('defaults to Lax for unknown values', () => {
+    assert.equal(chromeSameSite(99), 'Lax');
+    assert.equal(chromeSameSite(-1), 'Lax');
+  });
+});
+
+describe('firefoxSameSite', () => {
+  it('maps 0 to None', () => {
+    assert.equal(firefoxSameSite(0), 'None');
+  });
+
+  it('maps 1 to Lax', () => {
+    assert.equal(firefoxSameSite(1), 'Lax');
+  });
+
+  it('maps 2 to Strict', () => {
+    assert.equal(firefoxSameSite(2), 'Strict');
+  });
+
+  it('defaults to Lax for unknown values', () => {
+    assert.equal(firefoxSameSite(99), 'Lax');
+  });
+});
+
+// ============================================================
+// Cookie file parsing
+// ============================================================
+
+describe('parseCookieFile', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wr-cookie-test-'));
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  });
+
+  it('parses Netscape cookie format', () => {
+    const cookieFile = path.join(tmpDir, 'cookies.txt');
+    fs.writeFileSync(cookieFile, [
+      '# Netscape HTTP Cookie File',
+      '.example.com\tTRUE\t/\tTRUE\t1735689600\tsession_id\tabc123',
+      '.example.com\tTRUE\t/\tFALSE\t0\tpref\tdark_mode',
+    ].join('\n'));
+
+    const cookies = parseCookieFile(cookieFile, 'example.com');
+    assert.equal(cookies.length, 2);
+    assert.equal(cookies[0].name, 'session_id');
+    assert.equal(cookies[0].value, 'abc123');
+    assert.equal(cookies[0].domain, '.example.com');
+    assert.equal(cookies[0].secure, true);
+    assert.equal(cookies[0].expires, 1735689600);
+    assert.equal(cookies[1].name, 'pref');
+    assert.equal(cookies[1].secure, false);
+  });
+
+  it('filters by domain', () => {
+    const cookieFile = path.join(tmpDir, 'cookies.txt');
+    fs.writeFileSync(cookieFile, [
+      '.example.com\tTRUE\t/\tTRUE\t0\ttoken\tyes',
+      '.other.com\tTRUE\t/\tTRUE\t0\ttoken\tno',
+    ].join('\n'));
+
+    const cookies = parseCookieFile(cookieFile, 'example.com');
+    assert.equal(cookies.length, 1);
+    assert.equal(cookies[0].domain, '.example.com');
+  });
+
+  it('skips comment lines and short lines', () => {
+    const cookieFile = path.join(tmpDir, 'cookies.txt');
+    fs.writeFileSync(cookieFile, [
+      '# Comment',
+      '',
+      'short\tline',
+      '.example.com\tTRUE\t/\tTRUE\t0\tvalid\tcookie',
+    ].join('\n'));
+
+    const cookies = parseCookieFile(cookieFile, 'example.com');
+    assert.equal(cookies.length, 1);
+  });
+
+  it('throws when file not found', () => {
+    assert.throws(
+      () => parseCookieFile('/nonexistent/cookies.txt', 'example.com'),
+      /Cookie file not found/
+    );
+  });
+
+  it('returns all cookies when domain is empty', () => {
+    const cookieFile = path.join(tmpDir, 'cookies.txt');
+    fs.writeFileSync(cookieFile, [
+      '.a.com\tTRUE\t/\tTRUE\t0\tc1\tv1',
+      '.b.com\tTRUE\t/\tTRUE\t0\tc2\tv2',
+    ].join('\n'));
+
+    const cookies = parseCookieFile(cookieFile, '');
+    assert.equal(cookies.length, 2);
+  });
+});
+
+// ============================================================
+// extractCookies routing
+// ============================================================
+
+describe('extractCookies routing', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wr-cookie-test-'));
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  });
+
+  it('routes file paths to parseCookieFile', async () => {
+    const cookieFile = path.join(tmpDir, 'cookies.txt');
+    fs.writeFileSync(cookieFile, '.example.com\tTRUE\t/\tTRUE\t0\ttoken\tval');
+    const cookies = await extractCookies(cookieFile, 'example.com');
+    assert.equal(cookies.length, 1);
+    assert.equal(cookies[0].name, 'token');
+  });
+
+  it('detects .txt extension as file', async () => {
+    const cookieFile = path.join(tmpDir, 'my-cookies.txt');
+    fs.writeFileSync(cookieFile, '.test.com\tTRUE\t/\tTRUE\t0\tname\tvalue');
+    const cookies = await extractCookies(cookieFile, 'test.com');
+    assert.equal(cookies.length, 1);
+  });
+
+  it('throws for unknown browser name', async () => {
+    await assert.rejects(
+      () => extractCookies('netscape', 'example.com'),
+      /Unknown cookie source/
+    );
+  });
+});
+
+// ============================================================
+// Cascade with cookies
+// ============================================================
+
+describe('Cascade with cookies', () => {
+  let tmpDir, tmpFile;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wr-test-'));
+    tmpFile = path.join(tmpDir, 'domains.json');
+  });
+
+  afterEach(() => {
+    restore();
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  });
+
+  it('skips handlers and defuddle when cookies are provided', async () => {
+    // If cookies are provided, cascade should skip to browser.
+    // Since we cannot mock the browser layer easily, we test that
+    // the handler is NOT called even when the URL matches.
+    let handlerCalled = false;
+    const origRedditFetch = handlers.reddit.fetch;
+    handlers.reddit.fetch = async () => { handlerCalled = true; return 'handler result'; };
+
+    // The cascade will try browser (which will fail without Playwright in test),
+    // but the key assertion is that the handler was skipped.
+    try {
+      await cascade('https://www.reddit.com/r/test', {
+        domainsFile: tmpFile,
+        cookies: [{ name: 'session', value: 'abc', domain: '.reddit.com', path: '/' }],
+      });
+    } catch {
+      // Browser layer will fail in test environment, that's expected
+    }
+
+    assert.equal(handlerCalled, false, 'Handler should be skipped when cookies are provided');
+    handlers.reddit.fetch = origRedditFetch;
+  });
+
+  it('saves browser:authenticated method when cookies used', async () => {
+    // Mock that the cascade remembers the method correctly
+    saveDomainMemory({ 'example.com': 'browser:authenticated' }, tmpFile);
+    const memory = loadDomainMemory(tmpFile);
+    assert.equal(memory['example.com'], 'browser:authenticated');
+  });
+
+  it('remembered browser:authenticated without cookies falls through', async () => {
+    saveDomainMemory({ 'docs.example.com': 'browser:authenticated' }, tmpFile);
+
+    // Provide defuddle as fallback
+    childProcess.execSync = () => 'Fallback defuddle content that is longer than fifty characters to pass the minimum length validation easily.';
+
+    const { method } = await cascade('https://docs.example.com/page', {
+      domainsFile: tmpFile,
+      // No cookies provided
+    });
+
+    // Should have fallen through to defuddle since no cookies were given
+    assert.equal(method, 'defuddle');
+  });
+
+  it('remembered browser:authenticated with cookies uses browser path', async () => {
+    saveDomainMemory({ 'secure.example.com': 'browser:authenticated' }, tmpFile);
+
+    // The cascade will attempt browser with cookies.
+    // In test env, browser will fail, but we can verify the method is attempted
+    // by checking that defuddle is NOT tried first.
+    let defuddleCalled = false;
+    childProcess.execSync = () => { defuddleCalled = true; return 'defuddle content long enough to pass the fifty character validation threshold easily.'; };
+
+    try {
+      await cascade('https://secure.example.com/dashboard', {
+        domainsFile: tmpFile,
+        cookies: [{ name: 'auth', value: 'token123', domain: '.example.com', path: '/' }],
+      });
+    } catch {
+      // Browser layer fails in test env
+    }
+
+    // Defuddle should not have been called because we had cookies AND remembered method
+    assert.equal(defuddleCalled, false, 'Defuddle should not be called when authenticated method is remembered with cookies');
   });
 });

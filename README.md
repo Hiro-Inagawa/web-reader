@@ -113,6 +113,34 @@ node render.js "https://example.com" --html
 node render.js "https://example.com" --wait 8000
 ```
 
+### Authenticated Access
+
+Read pages that require login by using your existing browser cookies. If you're logged into a site in Chrome, Edge, Brave, or Firefox, Web Reader can use those same cookies.
+
+```bash
+# Use cookies from your browser (auto-extracts and decrypts)
+node render.js "https://example.com/dashboard" --cookies-from chrome
+node render.js "https://example.com/dashboard" --cookies-from edge
+node render.js "https://example.com/dashboard" --cookies-from firefox
+
+# Use a Netscape-format cookie file (exported from browser extensions)
+node render.js "https://example.com/dashboard" --cookies cookies.txt
+```
+
+When cookies are provided, Web Reader skips the handler and defuddle layers and goes straight to the stealth browser with your cookies injected.
+
+**How it works:**
+
+- **Chrome/Edge/Brave (Windows):** Extracts the AES-256 master key from `Local State` via DPAPI, then decrypts each cookie value from the SQLite database. Requires Python for SQLite access (handles WAL journals and browser locks).
+- **Firefox (all platforms):** Reads cookies directly from `cookies.sqlite` (unencrypted).
+- **Cookie files:** Parses standard Netscape/curl format (tab-separated, used by most cookie export extensions).
+
+**Limitations:**
+
+- Chrome/Edge/Brave extraction is Windows-only (macOS needs Keychain, Linux needs libsecret)
+- Edge holds an exclusive lock on its cookie database while running. Close Edge briefly, or use a cookie file instead
+- Chrome allows shared reads while running (works without closing)
+
 ## Battle-Tested Sites
 
 These are sites known for aggressive bot detection, JavaScript-only rendering, or outright blocking of automated tools. Web Reader handles all of them.
@@ -177,6 +205,7 @@ The script uses a temp `domains.json` so it doesn't pollute your real domain mem
 ## Requirements
 
 - Node.js v18+
+- Python 3.6+ (for browser cookie extraction only)
 - ~110 MB disk space (for Chromium, downloaded once during setup)
 - Optional: `defuddle` CLI for Layer 2
 

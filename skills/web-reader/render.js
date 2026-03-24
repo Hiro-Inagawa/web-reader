@@ -382,9 +382,13 @@ async function cascade(url, opts = {}) {
       } else if (remembered === 'defuddle') {
         result = tryDefuddle(url);
         if (result) method = 'defuddle';
-      } else if (remembered === 'browser') {
-        result = await fetchWithBrowser(url, browserOpts);
-        if (result) method = 'browser';
+      } else if (remembered === 'browser' || remembered === 'browser:authenticated') {
+        if (remembered === 'browser:authenticated' && !hasAuth) {
+          console.error('[web-reader] Remembered as authenticated but no cookies provided, trying full cascade');
+        } else {
+          result = await fetchWithBrowser(url, browserOpts);
+          if (result) method = hasAuth ? 'browser:authenticated' : 'browser';
+        }
       }
     } catch (e) {
       console.error('[web-reader] Remembered method threw: ' + e.message);

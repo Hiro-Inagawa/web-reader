@@ -19,32 +19,6 @@ const os = require('os');
 const crypto = require('crypto');
 const childProcess = require('child_process');
 
-// --- Locked file copy (Windows) ---
-
-function copyLockedFile(src, dst) {
-  // Use .NET FileStream with FileShare.ReadWrite to read files locked by browsers
-  const srcEscaped = src.replace(/'/g, "''");
-  const dstEscaped = dst.replace(/'/g, "''");
-  const tmpScript = path.join(os.tmpdir(), 'wr-copy-' + process.pid + '.ps1');
-
-  fs.writeFileSync(tmpScript, [
-    "$src = [IO.File]::Open('" + srcEscaped + "', 'Open', 'Read', 'ReadWrite')",
-    "$dst = [IO.File]::Create('" + dstEscaped + "')",
-    '$src.CopyTo($dst)',
-    '$dst.Close()',
-    '$src.Close()',
-  ].join('\n'));
-
-  try {
-    childProcess.execSync(
-      'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + tmpScript + '"',
-      { stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000 }
-    );
-  } finally {
-    try { fs.unlinkSync(tmpScript); } catch {}
-  }
-}
-
 // --- Browser cookie database paths ---
 
 function getBrowserPaths(browser) {
@@ -220,7 +194,7 @@ function firefoxSameSite(value) {
   }
 }
 
-// --- SQLite reading via Python (handles WAL + locked files natively) ---
+// --- SQLite reading via Python subprocess (handles WAL + locked files natively) ---
 
 function queryBrowserDB(dbPath, domain, dbType) {
   if (!fs.existsSync(dbPath)) {
@@ -480,5 +454,4 @@ module.exports = {
   chromeTimeToUnix,
   chromeSameSite,
   firefoxSameSite,
-  copyLockedFile,
 };

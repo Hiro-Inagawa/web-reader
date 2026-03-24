@@ -15,6 +15,7 @@ import sys
 import os
 import shutil
 import tempfile
+import base64
 
 def copy_with_retry(src, dst):
     """Copy a file, handling browser locks via multiple strategies."""
@@ -176,7 +177,6 @@ def main():
             for key in row.keys():
                 val = row[key]
                 if isinstance(val, bytes):
-                    import base64
                     row_dict[key] = {"__bytes__": base64.b64encode(val).decode('ascii')}
                 else:
                     row_dict[key] = val
