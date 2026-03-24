@@ -461,6 +461,7 @@ if (require.main === module) {
     console.error('  --html                   Return raw HTML instead of text');
     console.error('  --method <method>        Force: defuddle, browser, or handler');
     console.error('  --cookies-from <browser> Use cookies from: chrome, edge, brave, firefox');
+    console.error('                           With profile: chrome:"Profile 2", edge:"Profile 1"');
     console.error('  --cookies <file>         Use cookies from a Netscape cookie file');
     process.exit(1);
   }

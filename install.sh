@@ -15,6 +15,8 @@ git clone --depth 1 "$REPO" "$TMP_DIR" 2>/dev/null
 # Create skill directory and copy files
 mkdir -p "$SKILL_DIR"
 cp "$TMP_DIR/skills/web-reader/render.js" "$SKILL_DIR/"
+cp "$TMP_DIR/skills/web-reader/cookies.js" "$SKILL_DIR/"
+cp "$TMP_DIR/skills/web-reader/query-cookies.py" "$SKILL_DIR/"
 cp "$TMP_DIR/skills/web-reader/SKILL.md" "$SKILL_DIR/"
 cp "$TMP_DIR/skills/web-reader/package.json" "$SKILL_DIR/"
 

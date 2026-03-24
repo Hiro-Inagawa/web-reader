@@ -21,8 +21,9 @@ const childProcess = require('child_process');
 
 // --- Browser cookie database paths ---
 
-function getBrowserPaths(browser) {
+function getBrowserPaths(browser, profile) {
   const platform = process.platform;
+  const profileDir = profile || 'Default';
 
   if (platform === 'win32') {
     const local = process.env.LOCALAPPDATA;
@@ -30,15 +31,15 @@ function getBrowserPaths(browser) {
 
     const chromiumPaths = {
       chrome: {
-        cookies: path.join(local, 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies'),
+        cookies: path.join(local, 'Google', 'Chrome', 'User Data', profileDir, 'Network', 'Cookies'),
         localState: path.join(local, 'Google', 'Chrome', 'User Data', 'Local State'),
       },
       edge: {
-        cookies: path.join(local, 'Microsoft', 'Edge', 'User Data', 'Default', 'Network', 'Cookies'),
+        cookies: path.join(local, 'Microsoft', 'Edge', 'User Data', profileDir, 'Network', 'Cookies'),
         localState: path.join(local, 'Microsoft', 'Edge', 'User Data', 'Local State'),
       },
       brave: {
-        cookies: path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default', 'Network', 'Cookies'),
+        cookies: path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data', profileDir, 'Network', 'Cookies'),
         localState: path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data', 'Local State'),
       },
     };
@@ -239,25 +240,10 @@ function queryBrowserDB(dbPath, domain, dbType) {
 
 // --- Chromium cookie extraction ---
 
-async function getChromiumCookies(browser, domain) {
-  if (process.platform !== 'win32') {
-    throw new Error(browser + ' cookie extraction is currently Windows-only. Use firefox or --cookies file on ' + process.platform + '.');
-  }
-
-  const paths = getBrowserPaths(browser);
-  console.error('[cookies] Extracting ' + browser + ' cookies for ' + domain);
-
-  // Get the master decryption key
-  const masterKey = getChromiumMasterKey(paths.localState);
-  console.error('[cookies] Master key decrypted');
-
-  // Query the cookie database via Python (handles WAL + file locks)
-  const rows = queryBrowserDB(paths.cookies, domain, 'chromium');
-
+function decryptChromiumRows(rows, masterKey, domain) {
   const cookies = [];
   for (const row of rows) {
     try {
-      // Decode base64 encrypted_value from Python
       const encryptedBuf = row.encrypted_value?.__bytes__
         ? Buffer.from(row.encrypted_value.__bytes__, 'base64')
         : Buffer.from(row.encrypted_value || '', 'utf8');
@@ -277,6 +263,94 @@ async function getChromiumCookies(browser, domain) {
       });
     } catch (e) {
       console.error('[cookies] Failed to decrypt cookie ' + row.name + ': ' + e.message);
+    }
+  }
+  return cookies;
+}
+
+function findChromiumProfiles(browser) {
+  const local = process.env.LOCALAPPDATA;
+  const baseDirs = {
+    chrome: path.join(local, 'Google', 'Chrome', 'User Data'),
+    edge: path.join(local, 'Microsoft', 'Edge', 'User Data'),
+    brave: path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data'),
+  };
+  const baseDir = baseDirs[browser];
+  if (!baseDir || !fs.existsSync(baseDir)) return ['Default'];
+
+  const profiles = [];
+  const entries = fs.readdirSync(baseDir);
+  for (const entry of entries) {
+    if (entry === 'Default' || entry.startsWith('Profile ')) {
+      const cookieDb = path.join(baseDir, entry, 'Network', 'Cookies');
+      if (fs.existsSync(cookieDb)) {
+        profiles.push(entry);
+      }
+    }
+  }
+  return profiles.length > 0 ? profiles : ['Default'];
+}
+
+async function getChromiumCookies(browser, domain, profile) {
+  if (process.platform !== 'win32') {
+    throw new Error(browser + ' cookie extraction is currently Windows-only. Use firefox or --cookies file on ' + process.platform + '.');
+  }
+
+  const paths = getBrowserPaths(browser, profile);
+  const label = profile ? browser + ' (' + profile + ')' : browser;
+  console.error('[cookies] Extracting ' + label + ' cookies for ' + domain);
+
+  // Get the master decryption key (shared across profiles)
+  const masterKey = getChromiumMasterKey(paths.localState);
+  console.error('[cookies] Master key decrypted');
+
+  // Query the cookie database via Python (handles WAL + file locks)
+  let rows;
+  try {
+    rows = queryBrowserDB(paths.cookies, domain, 'chromium');
+  } catch (e) {
+    rows = [];
+    console.error('[cookies] ' + e.message);
+  }
+
+  let cookies = decryptChromiumRows(rows, masterKey, domain);
+
+  // Auto-scan other profiles if no cookies found and no specific profile requested
+  if (cookies.length === 0 && !profile) {
+    const allProfiles = findChromiumProfiles(browser);
+    const otherProfiles = allProfiles.filter(p => p !== 'Default');
+
+    if (otherProfiles.length > 0) {
+      console.error('[cookies] No cookies in Default profile, scanning ' + otherProfiles.length + ' other profile(s)...');
+
+      let lockedProfile = null;
+      for (const p of otherProfiles) {
+        try {
+          const altPaths = getBrowserPaths(browser, p);
+          const altRows = queryBrowserDB(altPaths.cookies, domain, 'chromium');
+          const altCookies = decryptChromiumRows(altRows, masterKey, domain);
+
+          if (altCookies.length > 0) {
+            console.error('[cookies] Found ' + altCookies.length + ' cookies in ' + p);
+            cookies = altCookies;
+            break;
+          }
+        } catch (e) {
+          if (e.message.includes('exclusively locked') || e.message.includes('Cannot read')) {
+            lockedProfile = p;
+            console.error('[cookies] ' + p + ' is locked (active profile). Cookies are likely here.');
+          } else {
+            console.error('[cookies] Skipping ' + p + ': ' + e.message);
+          }
+        }
+      }
+
+      if (cookies.length === 0 && lockedProfile) {
+        console.error('[cookies] Your cookies are in ' + lockedProfile + ' but Chrome has it locked.');
+        console.error('[cookies] Options: (1) Close Chrome briefly and retry, or');
+        console.error('[cookies]          (2) Use --cookies-from "' + browser + ':' + lockedProfile + '" after closing Chrome, or');
+        console.error('[cookies]          (3) Export cookies to a file and use --cookies <file>');
+      }
     }
   }
 
@@ -427,14 +501,23 @@ async function extractCookies(source, domain) {
     return parseCookieFile(source, domain);
   }
 
-  const browser = source.toLowerCase();
+  // Parse browser:profile syntax (e.g., "chrome:Profile 2")
+  let browser, profile;
+  const colonIdx = source.indexOf(':');
+  if (colonIdx > 0) {
+    browser = source.slice(0, colonIdx).toLowerCase();
+    profile = source.slice(colonIdx + 1);
+  } else {
+    browser = source.toLowerCase();
+    profile = null;
+  }
 
   if (browser === 'firefox') {
     return await getFirefoxCookies(domain);
   }
 
   if (['chrome', 'edge', 'brave'].includes(browser)) {
-    return await getChromiumCookies(browser, domain);
+    return await getChromiumCookies(browser, domain, profile);
   }
 
   throw new Error('Unknown cookie source: ' + source + '. Use chrome, edge, brave, firefox, or a path to a cookie file.');
