@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const { extractCookies } = require('./cookies.js');
+
 const API_TIMEOUT = 15000;
 const MIN_CONTENT_LENGTH = 50;
 
@@ -276,8 +278,18 @@ async function launchStealth() {
 }
 
 async function fetchWithBrowser(url, opts = {}) {
-  const { waitTime = 3000, screenshot = false, html = false } = opts;
+  const { waitTime = 3000, screenshot = false, html = false, cookies = null } = opts;
   const { browser, context } = await launchStealth();
+
+  // Inject cookies before navigation (authenticated access)
+  if (cookies && cookies.length > 0) {
+    try {
+      await context.addCookies(cookies);
+      console.error('[web-reader] Injected ' + cookies.length + ' cookies');
+    } catch (e) {
+      console.error('[web-reader] Cookie injection warning: ' + e.message);
+    }
+  }
   const page = await context.newPage();
 
   try {
@@ -312,13 +324,27 @@ async function cascade(url, opts = {}) {
     screenshot = false,
     html = false,
     waitTime = 3000,
-    domainsFile = domainsPath
+    domainsFile = domainsPath,
+    cookies = null,
+    cookiesFrom = null,
   } = opts;
 
   const domain = getDomain(url);
   const memory = loadDomainMemory(domainsFile);
   const remembered = domain ? memory[domain] : null;
-  const browserOpts = { waitTime, screenshot, html };
+
+  // Extract cookies from browser if requested
+  let resolvedCookies = cookies;
+  if (!resolvedCookies && cookiesFrom) {
+    resolvedCookies = await extractCookies(cookiesFrom, domain);
+  }
+
+  const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies };
+  const hasAuth = resolvedCookies && resolvedCookies.length > 0;
+
+  if (hasAuth) {
+    console.error('[web-reader] Authenticated mode: using browser with ' + resolvedCookies.length + ' cookies');
+  }
 
   let result = null;
   let method = null;
@@ -370,30 +396,34 @@ async function cascade(url, opts = {}) {
   }
 
   if (!result) {
-    if (!screenshot && !html) {
-      for (const [name, handler] of Object.entries(handlers)) {
-        if (handler.match(url)) {
-          try {
-            result = await handler.fetch(url);
-            if (result) method = 'handler:' + name;
-          } catch (e) {
-            console.error('[web-reader] Handler ' + name + ' failed: ' + e.message);
+    // When authenticated (cookies provided), skip handlers and defuddle.
+    // Cookies only work in the browser layer.
+    if (!hasAuth) {
+      if (!screenshot && !html) {
+        for (const [name, handler] of Object.entries(handlers)) {
+          if (handler.match(url)) {
+            try {
+              result = await handler.fetch(url);
+              if (result) method = 'handler:' + name;
+            } catch (e) {
+              console.error('[web-reader] Handler ' + name + ' failed: ' + e.message);
+            }
+            break;
           }
-          break;
         }
+      }
+
+      if (!result && !screenshot && !html) {
+        console.error('[web-reader] Trying defuddle...');
+        result = tryDefuddle(url);
+        if (result) method = 'defuddle';
       }
     }
 
-    if (!result && !screenshot && !html) {
-      console.error('[web-reader] Trying defuddle...');
-      result = tryDefuddle(url);
-      if (result) method = 'defuddle';
-    }
-
     if (!result) {
-      console.error('[web-reader] Trying stealth browser...');
+      console.error('[web-reader] Trying stealth browser' + (hasAuth ? ' (authenticated)' : '') + '...');
       result = await fetchWithBrowser(url, browserOpts);
-      if (result) method = 'browser';
+      if (result) method = hasAuth ? 'browser:authenticated' : 'browser';
     }
   }
 
@@ -419,7 +449,15 @@ if (require.main === module) {
   const url = args.find(a => !a.startsWith('--'));
 
   if (!url) {
-    console.error('Usage: node render.js <url> [--wait ms] [--screenshot] [--html] [--method defuddle|browser|handler]');
+    console.error('Usage: node render.js <url> [options]');
+    console.error('');
+    console.error('Options:');
+    console.error('  --wait <ms>              Wait time for browser rendering (default: 3000)');
+    console.error('  --screenshot             Take a full-page screenshot');
+    console.error('  --html                   Return raw HTML instead of text');
+    console.error('  --method <method>        Force: defuddle, browser, or handler');
+    console.error('  --cookies-from <browser> Use cookies from: chrome, edge, brave, firefox');
+    console.error('  --cookies <file>         Use cookies from a Netscape cookie file');
     process.exit(1);
   }
 
@@ -434,8 +472,20 @@ if (require.main === module) {
   const forceMethod = args.includes('--method')
     ? args[args.indexOf('--method') + 1]
     : null;
+  const cookiesFrom = args.includes('--cookies-from')
+    ? args[args.indexOf('--cookies-from') + 1]
+    : null;
+  const cookiesFile = args.includes('--cookies')
+    ? args[args.indexOf('--cookies') + 1]
+    : null;
 
-  cascade(url, { forceMethod, screenshot, html, waitTime })
+  cascade(url, {
+    forceMethod,
+    screenshot,
+    html,
+    waitTime,
+    cookiesFrom: cookiesFrom || cookiesFile,
+  })
     .then(({ result }) => {
       if (result) {
         console.log(result);
