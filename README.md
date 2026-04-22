@@ -23,7 +23,11 @@ URL comes in
     |      Fast extraction, no browser needed. Handles ~70% of the web.
     |
     +-- 3. Stealth browser (SPAs, Cloudflare, everything else)
-           Headless Chromium with bot-detection bypass.
+    |      Headless Chromium with bot-detection bypass.
+    |
+    +-- 4. OpenCLI        (when stealth browser is blocked)
+           Real Chrome via CDP. Bypasses fingerprinting entirely.
+           Skipped automatically if Chrome isn't running.
 ```
 
 After each successful fetch, it saves the working method to `domains.json`. Next time the same domain is requested, it skips straight to what works.
