@@ -256,6 +256,39 @@ function tryDefuddle(url) {
   }
 }
 
+// --- OpenCLI Layer (real Chrome via CDP) ---
+function tryOpenCLI(url) {
+  try {
+    childProcess.execSync('opencli --version', { stdio: 'pipe', timeout: 5000 });
+  } catch {
+    return null; // opencli not installed
+  }
+
+  try {
+    childProcess.execSync('opencli browser open ' + JSON.stringify(url), {
+      timeout: 15000,
+      stdio: 'pipe'
+    });
+
+    let text = childProcess.execSync(
+      'opencli browser eval ' + JSON.stringify('document.body.innerText'),
+      { timeout: 10000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+
+    // opencli may return eval results as a JSON string
+    if (text.startsWith('"') && text.endsWith('"')) {
+      try { text = JSON.parse(text); } catch {}
+    }
+
+    try { childProcess.execSync('opencli browser close', { stdio: 'pipe', timeout: 5000 }); } catch {}
+
+    return text.length > MIN_CONTENT_LENGTH ? text : null;
+  } catch {
+    try { childProcess.execSync('opencli browser close', { stdio: 'pipe', timeout: 5000 }); } catch {}
+    return null;
+  }
+}
+
 // --- Stealth Browser Layer ---
 async function launchStealth() {
   const browser = await chromium.launch({ headless: true });
@@ -367,6 +400,10 @@ async function cascade(url, opts = {}) {
       result = await fetchWithBrowser(url, browserOpts);
       if (!result) throw new Error('Browser returned no content');
       method = 'browser';
+    } else if (forceMethod === 'opencli') {
+      result = tryOpenCLI(url);
+      if (!result) throw new Error('OpenCLI returned no content (is Chrome running with the extension?)');
+      method = 'opencli';
     }
   }
   else if (remembered) {
@@ -382,6 +419,9 @@ async function cascade(url, opts = {}) {
       } else if (remembered === 'defuddle') {
         result = tryDefuddle(url);
         if (result) method = 'defuddle';
+      } else if (remembered === 'opencli') {
+        result = tryOpenCLI(url);
+        if (result) method = 'opencli';
       } else if (remembered === 'browser' || remembered === 'browser:authenticated') {
         if (remembered === 'browser:authenticated' && !hasAuth) {
           console.error('[web-reader] Remembered as authenticated but no cookies provided, trying full cascade');
@@ -429,6 +469,12 @@ async function cascade(url, opts = {}) {
       result = await fetchWithBrowser(url, browserOpts);
       if (result) method = hasAuth ? 'browser:authenticated' : 'browser';
     }
+
+    if (!result && !screenshot && !html && !hasAuth) {
+      console.error('[web-reader] Trying OpenCLI (real Chrome)...');
+      result = tryOpenCLI(url);
+      if (result) method = 'opencli';
+    }
   }
 
   if (result && domain && method) {
@@ -441,7 +487,7 @@ async function cascade(url, opts = {}) {
 
 // --- Exports for testing ---
 module.exports = {
-  handlers, tryDefuddle, fetchWithBrowser, launchStealth,
+  handlers, tryDefuddle, tryOpenCLI, fetchWithBrowser, launchStealth,
   fetchWithTimeout, loadDomainMemory, saveDomainMemory,
   getDomain, cascade,
   API_TIMEOUT, MIN_CONTENT_LENGTH, domainsPath
@@ -459,7 +505,7 @@ if (require.main === module) {
     console.error('  --wait <ms>              Wait time for browser rendering (default: 3000)');
     console.error('  --screenshot             Take a full-page screenshot');
     console.error('  --html                   Return raw HTML instead of text');
-    console.error('  --method <method>        Force: defuddle, browser, or handler');
+    console.error('  --method <method>        Force: defuddle, browser, handler, or opencli');
     console.error('  --cookies-from <browser> Use cookies from: chrome, edge, brave, firefox');
     console.error('                           With profile: chrome:"Profile 2", edge:"Profile 1"');
     console.error('  --cookies <file>         Use cookies from a Netscape cookie file');
