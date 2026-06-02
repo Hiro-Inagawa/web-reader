@@ -97,4 +97,18 @@ If Defuddle is not installed, the skill still works. It just skips the Defuddle 
 | Defuddle layer always skipped | Run `npm install -g defuddle` |
 | Timeout on slow sites | Use `--wait 8000` for more rendering time |
 | Wrong method used for a domain | Delete or edit `domains.json` to reset |
-| Site still blocks after stealth | Some sites have aggressive anti-bot beyond what stealth can bypass |
+| Site still blocks after stealth | Some sites have aggressive anti-bot beyond what stealth can bypass. Try `--cookies-from <browser>` to read it as your logged-in self |
+| `Extracted 0 cookies` / `profile is locked` | The target browser is open and holding its cookie DB. **Close the browser fully**, then retry `--cookies-from chrome`. Or point at the right profile: `--cookies-from "chrome:Profile 2"` |
+| Reddit, LinkedIn, etc. return the logged-out view | Those need your session. Use `--cookies-from chrome` (browser closed) so the page renders as you see it |
+
+## Authenticated access (cookies)
+
+For sites that block anonymous access or hide content behind a login (Reddit search, LinkedIn job hiring teams, gated docs), inject your real browser session:
+
+```bash
+node <skill-directory>/render.js "<url>" --cookies-from chrome --wait 6000
+```
+
+Supported: `chrome`, `edge`, `brave`, `firefox`. Add a profile when cookies live in a non-default profile: `--cookies-from "chrome:Profile 2"`.
+
+**The target browser must be closed.** Chromium browsers lock their cookie database while running, so an open Chrome means zero cookies extracted. Close it fully (check the tray), then run the command. When cookies are present the cascade skips straight to the browser layer, since cookies only apply there.

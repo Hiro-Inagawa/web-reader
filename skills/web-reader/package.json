@@ -1,6 +1,6 @@
 {
   "name": "web-reader",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Renders JavaScript-heavy websites and returns their content.",
   "main": "render.js",
   "scripts": {

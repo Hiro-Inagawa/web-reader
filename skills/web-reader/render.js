@@ -61,7 +61,10 @@ const handlers = {
       const jsonUrl = url.replace(/\/?(\?.*)?$/, '.json$1');
       const separator = jsonUrl.includes('?') ? '&' : '?';
       const res = await fetchWithTimeout(jsonUrl + separator + 'limit=50', {
-        headers: { 'User-Agent': 'web-reader/1.0 (github.com/Hiro-Inagawa/web-reader)' }
+        // Reddit 403s non-browser UAs. A realistic UA gives the anonymous JSON
+        // path a chance on residential IPs; on a hard block, fall back to the
+        // browser layer with --cookies-from <browser>.
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' }
       });
       if (!res.ok) throw new Error('Reddit API returned ' + res.status);
       const data = await res.json();
@@ -292,8 +295,13 @@ function tryOpenCLI(url) {
 // --- Stealth Browser Layer ---
 async function launchStealth() {
   const browser = await chromium.launch({ headless: true });
+  // Derive the UA from the actual bundled Chromium so it never drifts out of
+  // sync with the browser version. A stale hardcoded UA is itself a fingerprint.
+  const majorVersion = browser.version().split('.')[0] || '131';
+  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/' + majorVersion + '.0.0.0 Safari/537.36';
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    userAgent,
     viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
     timezoneId: 'America/New_York',
@@ -323,6 +331,19 @@ async function fetchWithBrowser(url, opts = {}) {
       console.error('[web-reader] Cookie injection warning: ' + e.message);
     }
   }
+
+  // Text-only fetches don't need images, fonts, or media. Blocking them is
+  // faster and lighter. Keep them for screenshots (visual fidelity) and HTML.
+  if (!screenshot && !html) {
+    try {
+      await context.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (type === 'image' || type === 'font' || type === 'media') return route.abort();
+        return route.continue();
+      });
+    } catch (_e) { /* routing is best-effort */ }
+  }
+
   const page = await context.newPage();
 
   try {
@@ -339,7 +360,18 @@ async function fetchWithBrowser(url, opts = {}) {
       return await page.content();
     }
 
-    const text = await page.evaluate(() => document.body.innerText);
+    // Prefer the main content region and strip chrome (nav, header, footer,
+    // aside, scripts) so the output is article text, not menu soup. Fall back
+    // to the full body text if stripping leaves too little behind.
+    const text = await page.evaluate(() => {
+      const main = document.querySelector('main, article, [role="main"]') || document.body;
+      const clone = main.cloneNode(true);
+      clone.querySelectorAll('script, style, noscript, nav, header, footer, aside, [aria-hidden="true"]')
+        .forEach((el) => el.remove());
+      const cleaned = (clone.innerText || '').trim();
+      if (cleaned.length < 200) return (document.body.innerText || '').trim();
+      return cleaned;
+    });
 
     if (!text || text.trim().length < MIN_CONTENT_LENGTH) {
       return null;
@@ -366,10 +398,33 @@ async function cascade(url, opts = {}) {
   const memory = loadDomainMemory(domainsFile);
   const remembered = domain ? memory[domain] : null;
 
-  // Extract cookies from browser if requested
+  // Extract cookies from browser if requested. If the named browser yields
+  // nothing (commonly because it is open and locking its cookie DB), fall back
+  // to the other installed browsers before giving up.
   let resolvedCookies = cookies;
   if (!resolvedCookies && cookiesFrom) {
-    resolvedCookies = await extractCookies(cookiesFrom, domain);
+    try {
+      resolvedCookies = await extractCookies(cookiesFrom, domain);
+    } catch (e) {
+      console.error('[web-reader] Cookie extraction failed for ' + cookiesFrom + ': ' + e.message);
+    }
+    if ((!resolvedCookies || resolvedCookies.length === 0) && !cookiesFrom.includes(':')) {
+      const requested = cookiesFrom.toLowerCase();
+      for (const candidate of ['chrome', 'edge', 'brave', 'firefox']) {
+        if (candidate === requested) continue;
+        try {
+          const c = await extractCookies(candidate, domain);
+          if (c && c.length > 0) {
+            console.error('[web-reader] ' + cookiesFrom + ' returned no cookies, fell back to ' + candidate);
+            resolvedCookies = c;
+            break;
+          }
+        } catch { /* browser not installed, keep trying */ }
+      }
+    }
+    if (!resolvedCookies || resolvedCookies.length === 0) {
+      console.error('[web-reader] No cookies extracted. If the browser is open, close it fully and retry (Chromium locks its cookie DB while running).');
+    }
   }
 
   const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies };
@@ -496,25 +551,39 @@ module.exports = {
 // --- CLI Entry Point ---
 if (require.main === module) {
   const args = process.argv.slice(2);
-  const url = args.find(a => !a.startsWith('--'));
+  const VALUE_FLAGS = new Set(['--wait', '--method', '--cookies-from', '--cookies', '--concurrency']);
 
-  if (!url) {
-    console.error('Usage: node render.js <url> [options]');
+  // Collect positional args (URLs), skipping flags and the values they consume.
+  const urls = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      if (VALUE_FLAGS.has(a)) i++;
+      continue;
+    }
+    urls.push(a);
+  }
+
+  if (urls.length === 0) {
+    console.error('Usage: node render.js <url> [url2 url3 ...] [options]');
     console.error('');
     console.error('Options:');
     console.error('  --wait <ms>              Wait time for browser rendering (default: 3000)');
-    console.error('  --screenshot             Take a full-page screenshot');
+    console.error('  --screenshot             Take a full-page screenshot (single URL only)');
     console.error('  --html                   Return raw HTML instead of text');
     console.error('  --method <method>        Force: defuddle, browser, handler, or opencli');
+    console.error('  --concurrency <n>        Parallel fetches in batch mode (default: 4)');
     console.error('  --cookies-from <browser> Use cookies from: chrome, edge, brave, firefox');
     console.error('                           With profile: chrome:"Profile 2", edge:"Profile 1"');
     console.error('  --cookies <file>         Use cookies from a Netscape cookie file');
     process.exit(1);
   }
 
-  try { new URL(url); } catch {
-    console.error('Error: Invalid URL: ' + url);
-    process.exit(1);
+  for (const u of urls) {
+    try { new URL(u); } catch {
+      console.error('Error: Invalid URL: ' + u);
+      process.exit(1);
+    }
   }
 
   const waitTime = parseInt(args[args.indexOf('--wait') + 1]) || 3000;
@@ -529,24 +598,58 @@ if (require.main === module) {
   const cookiesFile = args.includes('--cookies')
     ? args[args.indexOf('--cookies') + 1]
     : null;
+  const concurrency = Math.max(1, parseInt(args[args.indexOf('--concurrency') + 1]) || 4);
 
-  cascade(url, {
-    forceMethod,
-    screenshot,
-    html,
-    waitTime,
-    cookiesFrom: cookiesFrom || cookiesFile,
-  })
-    .then(({ result }) => {
-      if (result) {
-        console.log(result);
-      } else {
-        console.error('[web-reader] All methods failed for ' + url);
+  const opts = { forceMethod, screenshot, html, waitTime, cookiesFrom: cookiesFrom || cookiesFile };
+
+  // Single URL: original behavior (clean stdout, exit 1 on failure).
+  if (urls.length === 1) {
+    cascade(urls[0], opts)
+      .then(({ result }) => {
+        if (result) {
+          console.log(result);
+        } else {
+          console.error('[web-reader] All methods failed for ' + urls[0]);
+          process.exit(1);
+        }
+      })
+      .catch(e => {
+        console.error('Error: ' + e.message);
         process.exit(1);
-      }
-    })
-    .catch(e => {
-      console.error('Error: ' + e.message);
+      });
+  } else {
+    // Batch mode: concurrency-limited, results printed in input order with headers.
+    if (screenshot) {
+      console.error('[web-reader] --screenshot uses a single fixed path and is not supported in batch mode.');
       process.exit(1);
-    });
+    }
+    (async () => {
+      const results = new Array(urls.length);
+      let next = 0;
+      let anyFail = false;
+      async function worker() {
+        for (;;) {
+          const idx = next++;
+          if (idx >= urls.length) return;
+          try {
+            const { result } = await cascade(urls[idx], opts);
+            results[idx] = result || null;
+            if (!result) anyFail = true;
+          } catch (e) {
+            results[idx] = null;
+            anyFail = true;
+            console.error('[web-reader] Error on ' + urls[idx] + ': ' + e.message);
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, urls.length) }, worker)
+      );
+      urls.forEach((u, i) => {
+        console.log('\n===== URL: ' + u + ' =====');
+        console.log(results[i] != null ? results[i] : '[web-reader] All methods failed');
+      });
+      process.exit(anyFail ? 1 : 0);
+    })();
+  }
 }
