@@ -5,6 +5,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const { extractCookies } = require('./cookies.js');
 
@@ -39,6 +40,92 @@ function getDomain(url) {
   } catch {
     return null;
   }
+}
+
+// --- Response Cache (atomic writes; on by default with a short TTL) ---
+// Stores successful, non-authenticated, non-screenshot fetches on disk so
+// re-reading the same URL within the TTL returns instantly.
+const cachePath = path.join(__dirname, '.cache');
+const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000;
+
+function cacheKey(url, mode) {
+  return crypto.createHash('sha256').update(JSON.stringify([url, mode])).digest('hex').slice(0, 40);
+}
+
+function cacheFilePath(url, mode, cacheDir) {
+  return path.join(cacheDir || cachePath, cacheKey(url, mode) + '.json');
+}
+
+function readCache(url, mode, { cacheDir = cachePath, ttlMs = DEFAULT_CACHE_TTL_MS } = {}) {
+  try {
+    const entry = JSON.parse(fs.readFileSync(cacheFilePath(url, mode, cacheDir), 'utf8'));
+    if (entry.url !== url || entry.mode !== mode) return null;
+    if (typeof entry.savedAt !== 'number' || (Date.now() - entry.savedAt) > ttlMs) return null;
+    return { content: entry.content, method: entry.method };
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(url, mode, content, method, { cacheDir = cachePath } = {}) {
+  const dir = cacheDir || cachePath;
+  const target = cacheFilePath(url, mode, dir);
+  // Random suffix in addition to pid: in batch mode several in-process workers
+  // share a pid, so pid alone is not a unique temp name.
+  const tmpPath = target + '.tmp.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(tmpPath, JSON.stringify({ url, mode, method, savedAt: Date.now(), content }));
+    fs.renameSync(tmpPath, target);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+// --- Cookie resolution (memoized per process run) ---
+// Cookies are a stable on-disk snapshot for the life of the run, so a
+// same-domain batch resolves them once instead of re-running DPAPI/SQLite per URL.
+const cookieMemo = new Map();
+
+async function resolveCookies(source, domain, { memo = cookieMemo } = {}) {
+  const key = source + '\u0000' + (domain || '');
+  if (memo.has(key)) return memo.get(key);
+
+  let resolved = null;
+  try {
+    resolved = await extractCookies(source, domain);
+  } catch (e) {
+    console.error('[web-reader] Cookie extraction failed for ' + source + ': ' + e.message);
+  }
+
+  // If the named browser yielded nothing (commonly because it is open and
+  // locking its cookie DB), fall back to the other installed browsers.
+  if ((!resolved || resolved.length === 0) && !source.includes(':')) {
+    const requested = source.toLowerCase();
+    for (const candidate of ['chrome', 'edge', 'brave', 'firefox']) {
+      if (candidate === requested) continue;
+      try {
+        const c = await extractCookies(candidate, domain);
+        if (c && c.length > 0) {
+          console.error('[web-reader] ' + source + ' returned no cookies, fell back to ' + candidate);
+          resolved = c;
+          break;
+        }
+      } catch { /* browser not installed, keep trying */ }
+    }
+  }
+
+  if (!resolved) resolved = [];
+  if (resolved.length === 0) {
+    console.error('[web-reader] No cookies extracted. If the browser is open, close it fully and retry (Chromium locks its cookie DB while running).');
+  }
+  memo.set(key, resolved);
+  return resolved;
+}
+
+// Build chromium.launch options, adding a proxy when one is supplied.
+function launchOpts(proxy) {
+  return proxy ? { headless: true, proxy: { server: proxy } } : { headless: true };
 }
 
 // --- Fetch with timeout ---
@@ -358,19 +445,32 @@ async function launchStealth() {
 }
 
 async function fetchWithBrowser(url, opts = {}) {
-  const { waitTime = 3000, screenshot = false, html = false, cookies = null, browser: pooledBrowser = null } = opts;
+  const { waitTime = 3000, screenshot = false, html = false, cookies = null, browser: pooledBrowser = null, waitForSelector = null, proxy = null } = opts;
 
   // Reuse a pooled browser when provided (batch mode); otherwise launch and
   // close our own. The browser launch is the expensive part, so pooling it
   // across a batch is the big speedup. The context is per-call either way.
-  const browser = pooledBrowser || await chromium.launch({ headless: true });
+  const browser = pooledBrowser || await chromium.launch(launchOpts(proxy));
   const ownBrowser = !pooledBrowser;
   const context = await newStealthContext(browser, { cookies, blockMedia: !screenshot && !html });
   const page = await context.newPage();
 
   try {
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(waitTime);
+
+    if (waitForSelector) {
+      // When the caller names the content selector, its appearance is the
+      // readiness signal, so we skip most of the fixed wait. Best-effort: on
+      // timeout, log and proceed rather than hang or throw.
+      try {
+        await page.waitForSelector(waitForSelector, { timeout: 10000 });
+      } catch {
+        console.error('[web-reader] Selector "' + waitForSelector + '" not found within 10s, proceeding anyway');
+      }
+      await page.waitForTimeout(Math.min(waitTime, 500));
+    } else {
+      await page.waitForTimeout(waitTime);
+    }
 
     if (screenshot) {
       const screenshotPath = path.join(os.tmpdir(), 'web-reader-screenshot.png');
@@ -418,46 +518,42 @@ async function cascade(url, opts = {}) {
     cookies = null,
     cookiesFrom = null,
     browser = null,
+    waitForSelector = null,
+    proxy = null,
+    useCache = true,
+    cacheTtlMs = DEFAULT_CACHE_TTL_MS,
+    cacheDir = cachePath,
+    cookieMemo: memo = cookieMemo,
   } = opts;
 
   const domain = getDomain(url);
   const memory = loadDomainMemory(domainsFile);
   const remembered = domain ? memory[domain] : null;
 
-  // Extract cookies from browser if requested. If the named browser yields
-  // nothing (commonly because it is open and locking its cookie DB), fall back
-  // to the other installed browsers before giving up.
+  // Resolve cookies (memoized per run, with cross-browser fallback) only when
+  // an explicit cookie source was requested.
   let resolvedCookies = cookies;
   if (!resolvedCookies && cookiesFrom) {
-    try {
-      resolvedCookies = await extractCookies(cookiesFrom, domain);
-    } catch (e) {
-      console.error('[web-reader] Cookie extraction failed for ' + cookiesFrom + ': ' + e.message);
-    }
-    if ((!resolvedCookies || resolvedCookies.length === 0) && !cookiesFrom.includes(':')) {
-      const requested = cookiesFrom.toLowerCase();
-      for (const candidate of ['chrome', 'edge', 'brave', 'firefox']) {
-        if (candidate === requested) continue;
-        try {
-          const c = await extractCookies(candidate, domain);
-          if (c && c.length > 0) {
-            console.error('[web-reader] ' + cookiesFrom + ' returned no cookies, fell back to ' + candidate);
-            resolvedCookies = c;
-            break;
-          }
-        } catch { /* browser not installed, keep trying */ }
-      }
-    }
-    if (!resolvedCookies || resolvedCookies.length === 0) {
-      console.error('[web-reader] No cookies extracted. If the browser is open, close it fully and retry (Chromium locks its cookie DB while running).');
-    }
+    resolvedCookies = await resolveCookies(cookiesFrom, domain, { memo });
   }
 
-  const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies, browser };
+  const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies, browser, waitForSelector, proxy };
   const hasAuth = resolvedCookies && resolvedCookies.length > 0;
 
   if (hasAuth) {
     console.error('[web-reader] Authenticated mode: using browser with ' + resolvedCookies.length + ' cookies');
+  }
+
+  // Response cache: serve a fresh-enough prior result instantly. Skip when
+  // authenticated (user-specific content), for screenshots (no text result),
+  // or when a method is forced (the caller wants a live fetch).
+  const mode = html ? 'html' : 'text';
+  if (useCache && !screenshot && !hasAuth && !forceMethod) {
+    const hit = readCache(url, mode, { cacheDir, ttlMs: cacheTtlMs });
+    if (hit) {
+      console.error('[web-reader] Cache hit for ' + url + ' (was: ' + hit.method + ')');
+      return { result: hit.content, method: hit.method, cached: true };
+    }
   }
 
   let result = null;
@@ -563,6 +659,12 @@ async function cascade(url, opts = {}) {
     saveDomainMemory(memory, domainsFile);
   }
 
+  // Cache successful, non-authenticated, non-screenshot results so a repeat
+  // read within the TTL is instant. Failures (null result) never reach here.
+  if (result && useCache && !screenshot && !hasAuth) {
+    writeCache(url, mode, result, method, { cacheDir });
+  }
+
   return { result, method };
 }
 
@@ -571,13 +673,15 @@ module.exports = {
   handlers, tryDefuddle, tryOpenCLI, fetchWithBrowser, launchStealth,
   fetchWithTimeout, loadDomainMemory, saveDomainMemory,
   getDomain, cascade,
+  cacheKey, cacheFilePath, readCache, writeCache, cachePath,
+  resolveCookies, cookieMemo, launchOpts,
   API_TIMEOUT, MIN_CONTENT_LENGTH, domainsPath
 };
 
 // --- CLI Entry Point ---
 if (require.main === module) {
   const args = process.argv.slice(2);
-  const VALUE_FLAGS = new Set(['--wait', '--method', '--cookies-from', '--cookies', '--concurrency']);
+  const VALUE_FLAGS = new Set(['--wait', '--method', '--cookies-from', '--cookies', '--concurrency', '--cache-ttl', '--wait-for', '--proxy']);
 
   // Collect positional args (URLs), skipping flags and the values they consume.
   const urls = [];
@@ -602,6 +706,10 @@ if (require.main === module) {
     console.error('  --cookies-from <browser> Use cookies from: chrome, edge, brave, firefox');
     console.error('                           With profile: chrome:"Profile 2", edge:"Profile 1"');
     console.error('  --cookies <file>         Use cookies from a Netscape cookie file');
+    console.error('  --wait-for <selector>    Wait for a CSS selector before extracting (faster, more reliable)');
+    console.error('  --proxy <url>            Route the browser layer through a proxy (http(s):// or socks5://)');
+    console.error('  --no-cache               Bypass the response cache (always fetch fresh)');
+    console.error('  --cache-ttl <minutes>    Response cache lifetime (default: 15)');
     process.exit(1);
   }
 
@@ -625,8 +733,17 @@ if (require.main === module) {
     ? args[args.indexOf('--cookies') + 1]
     : null;
   const concurrency = Math.max(1, parseInt(args[args.indexOf('--concurrency') + 1]) || 4);
+  const waitForSelector = args.includes('--wait-for')
+    ? args[args.indexOf('--wait-for') + 1]
+    : null;
+  const proxy = args.includes('--proxy')
+    ? args[args.indexOf('--proxy') + 1]
+    : null;
+  const useCache = !args.includes('--no-cache');
+  const cacheTtlMin = parseFloat(args[args.indexOf('--cache-ttl') + 1]);
+  const cacheTtlMs = Number.isFinite(cacheTtlMin) ? cacheTtlMin * 60 * 1000 : DEFAULT_CACHE_TTL_MS;
 
-  const opts = { forceMethod, screenshot, html, waitTime, cookiesFrom: cookiesFrom || cookiesFile };
+  const opts = { forceMethod, screenshot, html, waitTime, cookiesFrom: cookiesFrom || cookiesFile, waitForSelector, proxy, useCache, cacheTtlMs };
 
   // Single URL: original behavior (clean stdout, exit 1 on failure).
   if (urls.length === 1) {
@@ -656,7 +773,7 @@ if (require.main === module) {
       // routing, and non-browser methods (handlers, defuddle) run as normal.
       let pooledBrowser = null;
       try {
-        pooledBrowser = await chromium.launch({ headless: true });
+        pooledBrowser = await chromium.launch(launchOpts(proxy));
       } catch (e) {
         console.error('[web-reader] Shared browser launch failed, using per-URL browsers: ' + e.message);
       }

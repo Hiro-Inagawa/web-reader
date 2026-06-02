@@ -47,7 +47,37 @@ node <skill-directory>/render.js "https://example.com" --method handler
 # Batch: pass multiple URLs. One browser is pooled across the whole batch
 # (the expensive part), fetched concurrently, printed in input order.
 node <skill-directory>/render.js "https://a.com" "https://b.com" "https://c.com" --concurrency 4
+
+# Wait for a selector before extracting (faster + more reliable than a fixed wait)
+node <skill-directory>/render.js "https://example.com" --wait-for "main article"
+
+# Route the browser layer through a proxy
+node <skill-directory>/render.js "https://example.com" --method browser --proxy "http://host:8080"
+
+# Cache control (cache is ON by default, 15-minute TTL)
+node <skill-directory>/render.js "https://example.com" --no-cache        # always fresh
+node <skill-directory>/render.js "https://example.com" --cache-ttl 60    # 60-minute TTL
 ```
+
+## Response cache
+
+Successful fetches are cached on disk (in `.cache/` next to `domains.json`), so
+re-reading the same URL within the TTL returns instantly instead of re-rendering.
+On by default with a 15-minute TTL. Bypass with `--no-cache`, tune with
+`--cache-ttl <minutes>`. Authenticated (`--cookies-from`) and screenshot fetches
+are never cached, and failures are never cached. The cache key is the URL plus
+mode (text vs html).
+
+## Wait-for and proxy
+
+`--wait-for <selector>` makes the browser wait for that element before extracting,
+which is faster and more reliable than the fixed wait on JS-heavy pages. If the
+selector never appears it logs and proceeds rather than hanging. Without the flag,
+the default wait is unchanged.
+
+`--proxy <url>` routes the browser layer (`http(s)://` or `socks5://`). It does not
+affect the API handlers or defuddle, which use Node's fetch, so pair it with
+`--method browser` when you need everything proxied.
 
 ## Batch mode
 

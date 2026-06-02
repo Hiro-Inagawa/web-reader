@@ -10,7 +10,8 @@ const originalExecSync = childProcess.execSync;
 
 const {
   handlers, getDomain, loadDomainMemory, saveDomainMemory,
-  tryDefuddle, fetchWithTimeout, cascade, MIN_CONTENT_LENGTH
+  tryDefuddle, fetchWithTimeout, cascade, MIN_CONTENT_LENGTH,
+  readCache, writeCache, cacheKey, resolveCookies, launchOpts, fetchWithBrowser
 } = require('./render');
 
 const {
@@ -448,7 +449,7 @@ describe('Cascade', () => {
       data: { children: [{ kind: 't3', data: { title: 'Post', author: 'u', score: 1, num_comments: 0, selftext: '' } }] }
     });
 
-    const { result, method } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile });
+    const { result, method } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile, useCache: false });
     assert.ok(result);
     assert.equal(method, 'handler:reddit');
   });
@@ -458,7 +459,7 @@ describe('Cascade', () => {
       data: { children: [{ kind: 't3', data: { title: 'Post', author: 'u', score: 1, num_comments: 0, selftext: '' } }] }
     });
 
-    await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile });
+    await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile, useCache: false });
     const memory = loadDomainMemory(tmpFile);
     assert.equal(memory['reddit.com'], 'handler:reddit');
   });
@@ -469,14 +470,14 @@ describe('Cascade', () => {
       data: { children: [{ kind: 't3', data: { title: 'Post', author: 'u', score: 1, num_comments: 0, selftext: '' } }] }
     });
 
-    const { method } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile });
+    const { method } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile, useCache: false });
     assert.equal(method, 'handler:reddit');
   });
 
   it('falls through to defuddle when no handler matches', async () => {
     childProcess.execSync = () => 'This is clean extracted content from defuddle that is longer than the minimum content length threshold easily.';
 
-    const { result, method } = await cascade('https://docs.example.com/page', { domainsFile: tmpFile });
+    const { result, method } = await cascade('https://docs.example.com/page', { domainsFile: tmpFile, useCache: false });
     assert.ok(result);
     assert.equal(method, 'defuddle');
   });
@@ -755,6 +756,7 @@ describe('Cascade with cookies', () => {
 
     const { method } = await cascade('https://docs.example.com/page', {
       domainsFile: tmpFile,
+      useCache: false,
       // No cookies provided
     });
 
@@ -782,5 +784,130 @@ describe('Cascade with cookies', () => {
 
     // Defuddle should not have been called because we had cookies AND remembered method
     assert.equal(defuddleCalled, false, 'Defuddle should not be called when authenticated method is remembered with cookies');
+  });
+});
+
+// ============================================================
+// Response cache
+// ============================================================
+
+describe('Response cache', () => {
+  let tmpDir, tmpFile, cacheDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wr-cache-'));
+    tmpFile = path.join(tmpDir, 'domains.json');
+    cacheDir = path.join(tmpDir, '.cache');
+  });
+
+  afterEach(() => {
+    restore();
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  });
+
+  it('serves a hit without re-running the method', async () => {
+    writeCache('https://www.reddit.com/r/test', 'text', 'CACHED CONTENT', 'handler:reddit', { cacheDir });
+    let handlerCalled = false;
+    const orig = handlers.reddit.fetch;
+    handlers.reddit.fetch = async () => { handlerCalled = true; return 'fresh'; };
+    try {
+      const { result, method, cached } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile, cacheDir });
+      assert.equal(result, 'CACHED CONTENT');
+      assert.equal(method, 'handler:reddit');
+      assert.equal(cached, true);
+      assert.equal(handlerCalled, false);
+    } finally {
+      handlers.reddit.fetch = orig;
+    }
+  });
+
+  it('useCache:false bypasses the cache', async () => {
+    writeCache('https://www.reddit.com/r/test', 'text', 'STALE', 'handler:reddit', { cacheDir });
+    mockFetch({ data: { children: [{ kind: 't3', data: { title: 'Fresh', author: 'u', score: 1, num_comments: 0, selftext: '' } }] } });
+    const { result } = await cascade('https://www.reddit.com/r/test', { domainsFile: tmpFile, cacheDir, useCache: false });
+    assert.ok(result.includes('# Fresh'));
+    assert.ok(!result.includes('STALE'));
+  });
+
+  it('expired entries are a miss', () => {
+    writeCache('https://x.com/p', 'text', 'OLD', 'defuddle', { cacheDir });
+    assert.equal(readCache('https://x.com/p', 'text', { cacheDir, ttlMs: 0 }), null);
+  });
+
+  it('write produces exactly one json file and no temp files', () => {
+    writeCache('https://x.com/p', 'text', 'C', 'defuddle', { cacheDir });
+    const files = fs.readdirSync(cacheDir);
+    assert.equal(files.length, 1);
+    assert.ok(files[0].endsWith('.json'));
+    assert.ok(!files.some((f) => f.includes('.tmp.')));
+  });
+
+  it('mode is part of the key (text and html do not collide)', () => {
+    writeCache('https://x.com/p', 'text', 'T', 'defuddle', { cacheDir });
+    writeCache('https://x.com/p', 'html', 'H', 'browser', { cacheDir });
+    assert.equal(readCache('https://x.com/p', 'text', { cacheDir }).content, 'T');
+    assert.equal(readCache('https://x.com/p', 'html', { cacheDir }).content, 'H');
+  });
+});
+
+// ============================================================
+// Cookie memoization
+// ============================================================
+
+describe('Cookie memoization', () => {
+  it('returns the seeded value without re-extracting', async () => {
+    const memo = new Map();
+    const cookies = [{ name: 'a', value: 'b' }];
+    memo.set('chrome\u0000x.com', cookies);
+    const out = await resolveCookies('chrome', 'x.com', { memo });
+    assert.equal(out, cookies); // same reference, no FS/subprocess work
+  });
+
+  it('keys by domain', async () => {
+    const memo = new Map();
+    memo.set('chrome\u0000a.com', [{ name: 'a' }]);
+    memo.set('chrome\u0000b.com', [{ name: 'b' }]);
+    assert.equal((await resolveCookies('chrome', 'a.com', { memo }))[0].name, 'a');
+    assert.equal((await resolveCookies('chrome', 'b.com', { memo }))[0].name, 'b');
+  });
+
+  it('memoizes empty results', async () => {
+    const memo = new Map();
+    memo.set('chrome\u0000x.com', []);
+    assert.deepEqual(await resolveCookies('chrome', 'x.com', { memo }), []);
+  });
+});
+
+// ============================================================
+// launchOpts (proxy)
+// ============================================================
+
+describe('launchOpts', () => {
+  it('returns headless only when no proxy', () => {
+    assert.deepEqual(launchOpts(null), { headless: true });
+  });
+
+  it('includes the proxy server when provided', () => {
+    assert.deepEqual(launchOpts('http://x:8080'), { headless: true, proxy: { server: 'http://x:8080' } });
+  });
+});
+
+// ============================================================
+// wait-for selector (real browser, skip-guarded)
+// ============================================================
+
+describe('wait-for selector', () => {
+  it('captures content that appears after load', async (t) => {
+    let probe;
+    try {
+      probe = await require('playwright').chromium.launch({ headless: true });
+      await probe.close();
+    } catch {
+      t.skip('chromium not available');
+      return;
+    }
+    const url = 'data:text/html,<div id="late"></div><script>setTimeout(()=>{document.getElementById("late").textContent="HELLOWORLD ".repeat(20)},300)</script>';
+    const text = await fetchWithBrowser(url, { waitForSelector: '#late', waitTime: 3000 });
+    assert.ok(text && text.includes('HELLOWORLD'));
   });
 });
