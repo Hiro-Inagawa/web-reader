@@ -202,6 +202,20 @@ describe('Reddit handler fetch', () => {
       /Reddit API returned 403/
     );
   });
+
+  it('includes permalink and subreddit in listing when present', async () => {
+    mockFetch({
+      data: {
+        children: [
+          { kind: 't3', data: { title: 'Hit', author: 'a', score: 7, num_comments: 2, selftext: '', permalink: '/r/x/comments/abc/hit/', subreddit_name_prefixed: 'r/x' } }
+        ]
+      }
+    });
+
+    const result = await handlers.reddit.fetch('https://www.reddit.com/search/?q=hit');
+    assert.ok(result.includes('https://www.reddit.com/r/x/comments/abc/hit/'));
+    assert.ok(result.includes('r/x'));
+  });
 });
 
 // ============================================================

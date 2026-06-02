@@ -76,7 +76,12 @@ const handlers = {
           if (p.kind !== 't3') return;
           const d = p.data;
           lines.push('# ' + d.title);
-          lines.push('u/' + d.author + ' | Score: ' + d.score + ' | Comments: ' + d.num_comments);
+          const meta = (d.subreddit_name_prefixed ? d.subreddit_name_prefixed + ' | ' : '') +
+            'u/' + d.author + ' | Score: ' + d.score + ' | Comments: ' + d.num_comments;
+          lines.push(meta);
+          // The permalink makes search and listing results directly actionable:
+          // fetch the thread URL next, no HTML scraping for links required.
+          if (d.permalink) lines.push('https://www.reddit.com' + d.permalink);
           if (d.selftext) lines.push(d.selftext);
           lines.push('');
         });
@@ -293,15 +298,21 @@ function tryOpenCLI(url) {
 }
 
 // --- Stealth Browser Layer ---
-async function launchStealth() {
-  const browser = await chromium.launch({ headless: true });
-  // Derive the UA from the actual bundled Chromium so it never drifts out of
-  // sync with the browser version. A stale hardcoded UA is itself a fingerprint.
+
+// UA tracks the actual bundled Chromium so it never drifts out of sync with the
+// browser version. A stale hardcoded UA is itself a fingerprint.
+function buildUserAgent(browser) {
   const majorVersion = browser.version().split('.')[0] || '131';
-  const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
     '(KHTML, like Gecko) Chrome/' + majorVersion + '.0.0.0 Safari/537.36';
+}
+
+// Create a configured stealth context on an existing browser. Cheap (~ms),
+// unlike launching a browser (~seconds), so batch mode reuses one browser and
+// makes a fresh context per URL to keep cookies and routing per-domain correct.
+async function newStealthContext(browser, { cookies = null, blockMedia = false } = {}) {
   const context = await browser.newContext({
-    userAgent,
+    userAgent: buildUserAgent(browser),
     viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
     timezoneId: 'America/New_York',
@@ -315,13 +326,6 @@ async function launchStealth() {
     window.chrome = { runtime: {} };
   });
 
-  return { browser, context };
-}
-
-async function fetchWithBrowser(url, opts = {}) {
-  const { waitTime = 3000, screenshot = false, html = false, cookies = null } = opts;
-  const { browser, context } = await launchStealth();
-
   // Inject cookies before navigation (authenticated access)
   if (cookies && cookies.length > 0) {
     try {
@@ -333,8 +337,8 @@ async function fetchWithBrowser(url, opts = {}) {
   }
 
   // Text-only fetches don't need images, fonts, or media. Blocking them is
-  // faster and lighter. Keep them for screenshots (visual fidelity) and HTML.
-  if (!screenshot && !html) {
+  // faster and lighter. Keep them for screenshots and HTML (fidelity).
+  if (blockMedia) {
     try {
       await context.route('**/*', (route) => {
         const type = route.request().resourceType();
@@ -344,6 +348,24 @@ async function fetchWithBrowser(url, opts = {}) {
     } catch (_e) { /* routing is best-effort */ }
   }
 
+  return context;
+}
+
+async function launchStealth() {
+  const browser = await chromium.launch({ headless: true });
+  const context = await newStealthContext(browser, {});
+  return { browser, context };
+}
+
+async function fetchWithBrowser(url, opts = {}) {
+  const { waitTime = 3000, screenshot = false, html = false, cookies = null, browser: pooledBrowser = null } = opts;
+
+  // Reuse a pooled browser when provided (batch mode); otherwise launch and
+  // close our own. The browser launch is the expensive part, so pooling it
+  // across a batch is the big speedup. The context is per-call either way.
+  const browser = pooledBrowser || await chromium.launch({ headless: true });
+  const ownBrowser = !pooledBrowser;
+  const context = await newStealthContext(browser, { cookies, blockMedia: !screenshot && !html });
   const page = await context.newPage();
 
   try {
@@ -378,7 +400,10 @@ async function fetchWithBrowser(url, opts = {}) {
     }
     return text;
   } finally {
-    await browser.close();
+    try { await context.close(); } catch { /* ignore */ }
+    if (ownBrowser) {
+      try { await browser.close(); } catch { /* ignore */ }
+    }
   }
 }
 
@@ -392,6 +417,7 @@ async function cascade(url, opts = {}) {
     domainsFile = domainsPath,
     cookies = null,
     cookiesFrom = null,
+    browser = null,
   } = opts;
 
   const domain = getDomain(url);
@@ -427,7 +453,7 @@ async function cascade(url, opts = {}) {
     }
   }
 
-  const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies };
+  const browserOpts = { waitTime, screenshot, html, cookies: resolvedCookies, browser };
   const hasAuth = resolvedCookies && resolvedCookies.length > 0;
 
   if (hasAuth) {
@@ -624,6 +650,18 @@ if (require.main === module) {
       process.exit(1);
     }
     (async () => {
+      // Pool one browser for the whole batch. Browser launch is the expensive
+      // part (~seconds); reusing it across URLs is the main batch speedup. Each
+      // cascade still creates its own per-URL context for correct cookies and
+      // routing, and non-browser methods (handlers, defuddle) run as normal.
+      let pooledBrowser = null;
+      try {
+        pooledBrowser = await chromium.launch({ headless: true });
+      } catch (e) {
+        console.error('[web-reader] Shared browser launch failed, using per-URL browsers: ' + e.message);
+      }
+      const batchOpts = { ...opts, browser: pooledBrowser };
+
       const results = new Array(urls.length);
       let next = 0;
       let anyFail = false;
@@ -632,7 +670,7 @@ if (require.main === module) {
           const idx = next++;
           if (idx >= urls.length) return;
           try {
-            const { result } = await cascade(urls[idx], opts);
+            const { result } = await cascade(urls[idx], batchOpts);
             results[idx] = result || null;
             if (!result) anyFail = true;
           } catch (e) {
@@ -642,9 +680,15 @@ if (require.main === module) {
           }
         }
       }
-      await Promise.all(
-        Array.from({ length: Math.min(concurrency, urls.length) }, worker)
-      );
+      try {
+        await Promise.all(
+          Array.from({ length: Math.min(concurrency, urls.length) }, worker)
+        );
+      } finally {
+        if (pooledBrowser) {
+          try { await pooledBrowser.close(); } catch { /* ignore */ }
+        }
+      }
       urls.forEach((u, i) => {
         console.log('\n===== URL: ' + u + ' =====');
         console.log(results[i] != null ? results[i] : '[web-reader] All methods failed');

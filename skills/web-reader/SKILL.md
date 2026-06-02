@@ -43,13 +43,27 @@ node <skill-directory>/render.js "https://example.com" --html
 node <skill-directory>/render.js "https://example.com" --method defuddle
 node <skill-directory>/render.js "https://example.com" --method browser
 node <skill-directory>/render.js "https://example.com" --method handler
+
+# Batch: pass multiple URLs. One browser is pooled across the whole batch
+# (the expensive part), fetched concurrently, printed in input order.
+node <skill-directory>/render.js "https://a.com" "https://b.com" "https://c.com" --concurrency 4
 ```
+
+## Batch mode
+
+Pass two or more URLs and the skill fetches them concurrently, reusing a single
+browser for the run instead of relaunching one per URL. Output is grouped under
+`===== URL: ... =====` headers in the original order. Control parallelism with
+`--concurrency <n>` (default 4). `--screenshot` is single-URL only.
+
+This is the efficient path for multi-page research (e.g., reading a set of
+Reddit threads): one command, one browser launch, parallel fetches.
 
 ## Site Handlers
 
 | Site | Method | What You Get |
 |------|--------|-------------|
-| Reddit | JSON API | Posts, comments with threading, scores, usernames |
+| Reddit | JSON API | Posts and threaded comments, scores, usernames. Search and listing results include each post's permalink, so you can fetch threads directly without scraping links |
 | Hacker News | Firebase API | Stories, comment threads (top 20 with 5 replies each) |
 | Wikipedia | REST API | Full article text with sections |
 | GitHub repos | REST API | Repo info, stats, full README |
