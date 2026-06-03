@@ -11,7 +11,7 @@ __      _____ ___   ___ ___   _   ___  ___ ___
 
 **Read any website, including JavaScript SPAs, from Claude Code. One skill, all websites.**
 
-A Claude Code skill that reads any URL using the fastest method that works. It cascades through three layers automatically, then remembers what worked so the next request is instant.
+A Claude Code skill that reads any URL using the fastest method that works. It cascades through four layers automatically, caches successful reads, and remembers what worked so the next request is instant. Pass several URLs at once and it fetches them in parallel over a single pooled browser.
 
 ```
 URL comes in
@@ -115,7 +115,35 @@ node render.js "https://example.com" --html
 
 # Wait longer for slow sites
 node render.js "https://example.com" --wait 8000
+
+# Wait for specific content before extracting (faster, more reliable than a fixed wait)
+node render.js "https://example.com" --wait-for "main article"
+
+# Route the browser layer through a proxy (http(s):// or socks5://)
+node render.js "https://example.com" --method browser --proxy "http://host:8080"
 ```
+
+### Batch mode
+
+Pass two or more URLs and they're fetched concurrently, reusing a single browser for the whole run instead of relaunching one per URL. Output is grouped under `===== URL: ... =====` headers in input order.
+
+```bash
+node render.js "https://a.com" "https://b.com" "https://c.com" --concurrency 4
+```
+
+`--concurrency` defaults to 4. `--screenshot` is single-URL only.
+
+### Response cache
+
+Successful reads are cached on disk (in `.cache/`, beside `domains.json`), so re-reading the same URL within the TTL returns instantly instead of re-rendering. On by default with a 15-minute TTL.
+
+```bash
+node render.js "https://example.com"               # cached for 15 minutes
+node render.js "https://example.com" --no-cache     # always fetch fresh
+node render.js "https://example.com" --cache-ttl 60 # 60-minute TTL
+```
+
+Authenticated (`--cookies-from`) and screenshot fetches are never cached, and failures are never cached. The cache key is the URL plus mode (text vs HTML).
 
 ### Authenticated Access
 
@@ -170,7 +198,7 @@ Sites with public APIs get dedicated handlers that are faster and more reliable 
 
 | Site | Method | Output |
 |------|--------|--------|
-| Reddit | JSON API | Posts, threaded comments, scores |
+| Reddit | JSON API | Posts, threaded comments, scores; search/listing include permalinks |
 | Hacker News | Firebase API | Stories, comment threads |
 | Wikipedia | REST API | Full article text |
 | GitHub repos | REST API | Repo info, stats, README |
